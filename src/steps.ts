@@ -1,0 +1,191 @@
+import { createHash } from 'node:crypto'
+
+import type { CollectionBeforeChangeHook, CollectionConfig, CollectionSlug, Payload } from 'payload'
+
+import type { Answer, Flow, FlowRegistration, Resolved, Step, WizardRecord } from './types.js'
+
+const configOf = (payload: Payload): Resolved => {
+  const o = payload.config.custom?.wizards as Resolved | undefined
+  if (!o) throw new Error('Wizards: the plugin is not configured on this site.')
+  return o
+}
+
+/** A media file as the hash sees it: its id and when it last changed, so a swapped or replaced file counts as new. */
+const fileOf = (v: unknown) => (v && typeof v === 'object' ? [String((v as { id?: unknown }).id ?? ''), String((v as { updatedAt?: unknown }).updatedAt ?? '')] : v ? [String(v), ''] : null)
+
+/**
+ * What a person confirms, in the language they read it: question, body, kind, options, the stop message, and the
+ * video with its captions. Worked out each time a step is read in a locale, never stored, so it can't be stale or
+ * belong to another language.
+ */
+export const contentHash = (s: { question?: unknown; body?: unknown; kind?: unknown; options?: unknown; stopMessage?: unknown; video?: unknown; captions?: unknown }) =>
+  createHash('sha256')
+    .update(JSON.stringify([s.question ?? '', s.body ?? '', s.kind ?? '', (s.options as unknown[] | undefined)?.map((x) => { const o = x as { value?: unknown; label?: unknown; stops?: unknown }; return [o.value, o.label, Boolean(o.stops)] }) ?? [], s.stopMessage ?? '', fileOf(s.video), fileOf(s.captions)]))
+    .digest('hex')
+    .slice(0, 24)
+
+const idOf = (v: unknown) => (v && typeof v === 'object' ? (v as { id?: unknown }).id : v)
+
+const beforeChange =
+  (o: Resolved): CollectionBeforeChangeHook =>
+  async ({ data, originalDoc, req }) => {
+    const next = { ...originalDoc, ...data }
+    if (next.video && !next.captions) throw new Error('A step with a video needs its captions (a WebVTT file).')
+    if (next.kind === 'choice' && !(Array.isArray(next.options) && next.options.length >= 2)) throw new Error('A choice step needs at least two options.')
+    if (next.kind === 'choice') {
+      const values = (next.options as { value?: unknown }[]).map((x) => String(x?.value ?? ''))
+      // One value for a stopping and a going-on option would let the check accept either.
+      if (new Set(values).size !== values.length) throw new Error('Each option in a choice step needs its own value.')
+    }
+    if (next.kind !== 'info' && !String(next.stopMessage ?? '').trim()) throw new Error('A gate or choice step needs a stop message: what to do when the answer is No.')
+    if (o.media && (next.video || next.captions)) {
+      const mime = async (v: unknown) => String(((await req.payload.findByID({ collection: o.media as CollectionSlug, id: idOf(v) as string, depth: 0, overrideAccess: true, req }).catch(() => null)) as { mimeType?: unknown } | null)?.mimeType ?? '')
+      if (next.video && !(await mime(next.video)).startsWith('video/')) throw new Error('The video needs to be a video file.')
+      if (next.captions && !/^text\/(vtt|plain)$/.test(await mime(next.captions))) throw new Error('The captions need to be a WebVTT (.vtt) file.')
+    }
+    return data
+  }
+
+export const stepsCollection = (o: Resolved): CollectionConfig => ({
+  slug: o.slug,
+  labels: { singular: 'Guided step', plural: 'Guided steps' },
+  admin: { group: o.adminGroup, useAsTitle: 'question', defaultColumns: ['flow', 'group', 'order', 'question', 'active'] },
+  access: {
+    read: async (args) => ((await o.edit(args)) === true ? true : { active: { equals: true } }),
+    create: async (args) => (await o.edit(args)) === true,
+    update: async (args) => (await o.edit(args)) === true,
+    delete: async (args) => (await o.edit(args)) === true,
+  },
+  hooks: { beforeChange: [beforeChange(o)] },
+  indexes: [{ fields: ['flow', 'key'], unique: true }],
+  fields: [
+    { name: 'flow', type: 'text', required: true, index: true },
+    { name: 'key', type: 'text', required: true, admin: { description: 'Stable: answers name it. Don’t reuse a key for a different question.' } },
+    { name: 'group', type: 'text', required: true, admin: { description: 'The flow takes a group of steps in one place, such as "safety".' } },
+    { name: 'order', type: 'number', defaultValue: 100 },
+    { name: 'kind', type: 'select', required: true, defaultValue: 'gate', options: [{ label: 'Gate (Yes needed to go on)', value: 'gate' }, { label: 'Information (Next)', value: 'info' }, { label: 'Choice', value: 'choice' }] },
+    { name: 'question', type: 'text', required: true, localized: true },
+    { name: 'body', type: 'textarea', localized: true, admin: { description: 'The text version: everything the video says.' } },
+    ...(o.media
+      ? [
+          { name: 'video', type: 'upload' as const, relationTo: o.media as CollectionSlug },
+          { name: 'captions', type: 'upload' as const, relationTo: o.media as CollectionSlug, admin: { description: 'WebVTT captions. Required with a video.' } },
+        ]
+      : []),
+    {
+      name: 'options',
+      type: 'array',
+      admin: { condition: (d) => d?.kind === 'choice' },
+      fields: [
+        { name: 'value', type: 'text', required: true },
+        { name: 'label', type: 'text', required: true, localized: true },
+        { name: 'stops', type: 'checkbox', admin: { description: 'This answer stops the flow until changed.' } },
+      ],
+    },
+    { name: 'stopMessage', type: 'textarea', localized: true, admin: { description: 'What No says: what to do before going on.' } },
+    { name: 'active', type: 'checkbox', defaultValue: true, index: true },
+  ],
+})
+
+/** Every flow: the site's own and those other plugins registered at `config.custom.wizardFlows`. One owner each. */
+export function flowsOf(payload: Payload): Record<string, Flow> {
+  const o = configOf(payload)
+  const all: Record<string, Flow> = {}
+  const owner: Record<string, string> = {}
+  const add = (who: string, flows: Record<string, Flow>) => {
+    for (const [k, f] of Object.entries(flows ?? {})) {
+      if (owner[k]) throw new Error(`Wizards: the flow "${k}" is registered by both ${owner[k]} and ${who}.`)
+      if (!Array.isArray(f?.slots) || !f.slots.length) throw new Error(`Wizards: the flow "${k}" from ${who} has no slots.`)
+      const groups = f.slots.flatMap((s) => ('steps' in s ? [s.steps] : []))
+      // A group in two slots would ask each step twice, and no answer could pass.
+      if (new Set(groups).size !== groups.length) throw new Error(`Wizards: the flow "${k}" from ${who} uses a group of steps twice.`)
+      owner[k] = who
+      all[k] = f
+    }
+  }
+  add('the site', o.flows)
+  const regs = payload.config.custom?.wizardFlows as FlowRegistration[] | undefined
+  for (const r of Array.isArray(regs) ? regs : []) add(String(r?.owner ?? 'a plugin'), r?.flows)
+  return all
+}
+
+type Doc = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
+const urlOf = (v: unknown) => (v && typeof v === 'object' && typeof (v as { url?: unknown }).url === 'string' ? (v as { url: string }).url : null)
+
+/**
+ * The content steps of a flow, in slot order, as the client shows them, in the locale asked for. Only active steps.
+ * `empty` names any group of steps with no active step: the flow can't be passed until an editor fixes it.
+ */
+export async function flowSteps(payload: Payload, args: { flow: string; locale?: string }): Promise<{ slots: ({ code: string } | { step: Step })[]; empty: string[] }> {
+  const o = configOf(payload)
+  const flows = flowsOf(payload)
+  const flow = Object.hasOwn(flows, args.flow) ? flows[args.flow]! : null
+  if (!flow) throw new Error(`Wizards: no flow "${args.flow}".`)
+  const docs = (await payload.find({ collection: o.slug as CollectionSlug, where: { and: [{ flow: { equals: args.flow } }, { active: { equals: true } }] }, sort: ['order', 'key'], pagination: false, depth: 1, overrideAccess: true, ...(args.locale ? { locale: args.locale as never } : {}) })).docs as Doc[]
+  const out: ({ code: string } | { step: Step })[] = []
+  const empty: string[] = []
+  for (const slot of flow.slots) {
+    if ('code' in slot) out.push({ code: slot.code })
+    else {
+      const group = docs.filter((x) => x.group === slot.steps)
+      if (!group.length) empty.push(slot.steps)
+      for (const d of group) {
+        const video = urlOf(d.video)
+        const captions = urlOf(d.captions)
+        out.push({
+          step: {
+            key: d.key,
+            group: d.group,
+            kind: d.kind,
+            question: d.question,
+            body: d.body ?? '',
+            video: video && captions ? { url: video, captionsUrl: captions } : null,
+            options: ((d.options ?? []) as Doc[]).map((x) => ({ value: String(x.value), label: String(x.label), stops: Boolean(x.stops) })),
+            stopMessage: d.stopMessage ?? '',
+            hash: contentHash(d),
+          },
+        })
+      }
+    }
+  }
+  return { slots: out, empty }
+}
+
+/**
+ * Checks a flow's answers on the server before the owner acts. Fails closed: every active content step must be
+ * answered exactly once, with the wording the server has now in that locale (its hash), and every gate Yes and every
+ * choice a non-stopping option. A group of steps with no active step fails (`noSteps`): a safety group emptied by
+ * mistake never waves a flow through. A step changed since the screen loaded fails, and the person sees the new
+ * wording. Returns the record to store with the action: the locale, and for each step the hash and the question as
+ * the person read it, with the answer and the time.
+ */
+export async function answersFor(payload: Payload, args: { flow: string; answers: unknown; locale?: string }): Promise<{ ok: true; record: WizardRecord } | { ok: false; problem: 'unknownFlow' | 'noSteps' | 'badAnswers' | 'missing' | 'extra' | 'changed' | 'notYes'; key?: string }> {
+  let flow: { slots: ({ code: string } | { step: Step })[]; empty: string[] }
+  try {
+    flow = await flowSteps(payload, { flow: args.flow, locale: args.locale })
+  } catch {
+    return { ok: false, problem: 'unknownFlow' }
+  }
+  if (flow.empty.length) return { ok: false, problem: 'noSteps', key: flow.empty[0] }
+  if (!Array.isArray(args.answers) || args.answers.some((a) => !a || typeof a !== 'object' || typeof (a as Answer).key !== 'string' || typeof (a as Answer).hash !== 'string' || typeof (a as Answer).value !== 'string')) return { ok: false, problem: 'badAnswers' }
+  const answers = args.answers as Answer[]
+  const steps = flow.slots.flatMap((s) => ('step' in s ? [s.step] : []))
+  const byKey = new Map<string, Answer[]>()
+  for (const a of answers) byKey.set(a.key, [...(byKey.get(a.key) ?? []), a])
+  for (const a of answers) if (!steps.some((s) => s.key === a.key)) return { ok: false, problem: 'extra', key: a.key }
+  for (const s of steps) {
+    const given = byKey.get(s.key) ?? []
+    if (given.length !== 1) return { ok: false, problem: given.length ? 'extra' : 'missing', key: s.key }
+    const a = given[0]!
+    if (a.hash !== s.hash) return { ok: false, problem: 'changed', key: s.key }
+    if (s.kind === 'gate' && a.value !== 'yes') return { ok: false, problem: 'notYes', key: s.key }
+    if (s.kind === 'info' && a.value !== 'seen') return { ok: false, problem: 'notYes', key: s.key }
+    if (s.kind === 'choice') {
+      const opt = s.options.find((x) => x.value === a.value)
+      if (!opt || opt.stops) return { ok: false, problem: 'notYes', key: s.key }
+    }
+  }
+  const localization = payload.config.localization
+  const locale = args.locale ?? (localization ? localization.defaultLocale : null)
+  return { ok: true, record: { flow: args.flow, at: new Date().toISOString(), locale, answers: steps.map((s) => ({ key: s.key, hash: s.hash, value: byKey.get(s.key)![0]!.value, question: s.question })) } }
+}
