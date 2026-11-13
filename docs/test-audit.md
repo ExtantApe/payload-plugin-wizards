@@ -1,6 +1,6 @@
 # Test audit
 
-Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". Newest first.
+Kept by this repo's maintainers: after each feature or fix, and at least every 14 days while it changes. Newest first.
 
 ## 2026-11-10: after the security read
 
@@ -15,7 +15,7 @@ Kept by this repo's owning session, per `~/Code/CLAUDE.md`, "Test self-audits". 
 
 Gaps added: all of the above. Mutation check: 11 of 11 caught, after adding the stop-message test for the one that survived. Skipped: a real browser and screen reader (the owner's real-client batch).
 
-## 2026-11-10: 0.1.0 (K81)
+## 2026-11-10: 0.1.0
 
 | Promise | Test |
 | --- | --- |

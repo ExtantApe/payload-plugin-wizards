@@ -1,18 +1,18 @@
 # 0001: Wizards design record
 
-Status: **built** (2026-11-10), 0.1.0. Task K81, P4. The security read's changes are in `docs/decisions.md`; where this record differs, the decisions win.
+Status: **built** (2026-11-10), 0.1.0. The security read's changes are in `docs/decisions.md`; where this record differs, the decisions win.
 
 ## Context
 
-The Captive Origins kit activation wizard (captive-origins `docs/kits-activation-wizard-plan.md`) needs:
+The Captive Origins kit activation wizard needs:
 - a gated flow: one question per screen, every step needing an answer before the next, and Back on each;
 - safety steps where No stops the flow, says what to do, and keeps the step until Yes;
 - a short video and a text version per step, edited in the admin;
 - the confirmed answers recorded on the kit's event, so "one free retest, then it's on you" has a record of what was confirmed.
 
-The packing-station plan (`docs/kits-packing-station-plan.md`, "Architecture") put that in its own plugin under the owner's build-it-right rule (D2), because care sheets, onboarding and event check-in have the same shape. Platform named it, and the owner approved the name on 2026-11-10 (`ops/plugin-names.md`): **Wizards**, `@extantape/payload-plugin-wizards`, collection `guided-steps`.
+The kit packing-station plan put that in its own plugin under the owner's build-it-right rule (agnostic plugins, built right the first time), because care sheets, onboarding and event check-in have the same shape. The platform team named it, and the owner approved the name on 2026-11-10: **Wizards**, `@extantape/payload-plugin-wizards`, collection `guided-steps`.
 
-MIT, public from its first push (D5). Agnostic: no imports of Sample Kits or Scan.
+MIT, public from its first push. Agnostic: no imports of Sample Kits or Scan.
 
 ## Decision
 
@@ -83,7 +83,7 @@ Other plugins register flows at `config.custom.wizardFlows` with no import, as w
 
 - **Sample Kits:** registers `kit-activation`. Its code steps use Scan's components, and its action records the `record` on the kit's event.
 - **Scan:** used inside code steps; no dependency.
-- **Seed (D8):** `guided-steps` is a new collection. The tour needs the safety steps with text, without video until the owner's exists.
+- **Seed data:** `guided-steps` is a new collection. The tour needs the safety steps with text, without video until the owner's exists.
 
 ## Tests (planned)
 
