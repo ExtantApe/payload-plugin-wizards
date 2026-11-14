@@ -4,7 +4,7 @@ Status: **built** (2026-11-10), 0.1.0. The security read's changes are in `docs/
 
 ## Context
 
-The Captive Origins kit activation wizard needs:
+The first site's kit activation wizard needs:
 - a gated flow: one question per screen, every step needing an answer before the next, and Back on each;
 - safety steps where No stops the flow, says what to do, and keeps the step until Yes;
 - a short video and a text version per step, edited in the admin;
