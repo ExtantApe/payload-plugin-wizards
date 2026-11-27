@@ -17,14 +17,14 @@ Wizards for Payload: gated step-by-step flows, one question per screen with Yes 
   - Each step's content hash covers what a person confirms (question, text, kind, options, stop message, video and captions) in the language they read it. It's worked out each time a step is read, so it can't go stale.
   - Editors (`access.edit`, required) change steps. The public reads active ones only.
 - **Flows are registered in code:** a list of slots, either your own code steps (finding a kit with the camera, choosing an animal) or a group of content steps. Other plugins register flows at `config.custom.wizardFlows` with no import, and a flow registered twice, or one that uses a group of steps twice, stops the site at start-up.
-- **`flowSteps(payload, { flow, locale })`** gives the flow's slots, with active steps in order, for the page.
+- **`flowSteps(payload, { flow, locale, req })`** gives the flow's slots, with active steps in order, for the page.
 - **`<Wizard>`** (`./client`) shows one step per screen:
   - focus on the question, "Step N of M", and Back;
   - No shows the stop message and stays, and withdraws an earlier Yes on that step;
   - video with captions, never autoplaying, and the text version always shown;
   - your code steps rendered with `next` and `back`;
   - state in memory only.
-- **The answers are checked on the server, not trusted.** Call `answersFor(payload, { flow, answers })` before acting. It refuses:
+- **The answers are checked on the server, not trusted.** Call `answersFor(payload, { flow, answers, req })` before acting. It refuses:
   - a No, or a stopping choice;
   - a missing, extra or repeated step;
   - a group of steps with no active step, so a safety group that was never seeded, is misspelled or was switched off never waves the flow through;
@@ -32,6 +32,34 @@ Wizards for Payload: gated step-by-step flows, one question per screen with Yes 
   - a flow it doesn't know.
 
   Pass the `locale` the person read. It returns the record to keep with your action: the language, each step's hash and question as the person read them, the answers, and the time. The hash identifies the full wording; the plugin keeps no copy of older wording, so keep versions on `guided-steps` if you need to show a past version in full. A client can't skip a gate by posting straight to your action.
+
+## Scope: one site's steps for one site
+
+For a platform that runs several sites from one database. Unset, nothing changes: every caller sees every step, as in 0.1.0.
+
+```ts
+wizardsPlugin({
+  flows,
+  access: { edit },
+  scope: {
+    where: ({ req }) => {
+      if (!req.user?.site) throw new Error('No site') // refuses plainly
+      return { site: { equals: req.user.site } }
+    },
+    indexWith: ['site'],
+  },
+})
+```
+
+- **`where`** runs on every call with the request. If it throws, the call is refused. A scope may use only `equals` and `in`. `equals` takes one non-empty string or number. `in` takes a non-empty list of them. The plugin refuses everything else at every depth, so a filter can't match everything by accident or mean one thing in memory and another in a database: any other operator (`not_equals`, `not_in`, `exists`, `like`, `contains` and the comparisons), an empty string, `null` or `undefined`, a list with an empty or null entry, an empty `and` or `or`, an empty `{}`, and anything that isn't a plain object. `and` and `or` can nest. Build `or` lists so that a user with no sites throws instead of producing `{ or: [] }`. If a user's site can be an object (a populated relationship), return its id. A host that wants every site leaves `scope` unset.
+- **Reads:** the scope is ANDed with what the access rules already allow, so the REST API, GraphQL, count and the Local API with `overrideAccess: false` only see the caller's steps. `flowSteps` and `answersFor` take `req` and apply the scope themselves. With a scope set and no `req` they refuse (`answersFor` answers `noScope`) and never fall back to all sites.
+- **Writes:** update and delete access are limited to the caller's steps. A create or update is checked at the database adapter, on the step exactly as it will be stored, after every field hook and every collection hook, including any your own plugins add. One that would leave the scope, including a move to another site, is refused with a 403 and nothing is written. That works the same with or without database transactions. The stored value of every field in the scope has to be a string or a number, so a missing, null, list or object value is refused. An update or a delete also reads the steps it would touch and refuses unless every one of them is inside the scope, so a call can't take another site's step into its own site or delete it. That covers `overrideAccess: true` calls and direct `db.updateOne`, `db.deleteOne` and `db.deleteMany` calls, and a `where` that matches steps on two sites is refused whole. A call with no `req` is refused. While a scope is set, `updateMany` and `upsert` on the adapter for the steps are refused, and so is `updateOne` with `upsert` set. A delete through the collection is also checked in `beforeDelete`. The stored-step check reads first and writes after, and the write is handed the scope in its `where`, so a step that moves to another site in between is not touched (the call then does nothing, or touches only the steps still in scope). The read uses the call's locale. A seeding script has to pass a `req` the hook accepts.
+- **Plugin order:** the check wraps `db`, so set `db` in the config before this plugin and list `wizardsPlugin` last among the plugins that touch `db`. A plugin listed before it that wraps `create`, `updateOne` or `deleteOne` (or `deleteMany`) runs after the check, so its changes to those calls are not checked. At start-up the plugin looks at the adapter the site actually runs. If `find`, `create`, `updateOne`, `deleteOne`, `deleteMany`, `updateMany` or `upsert` is not the one this plugin wrapped (a later plugin put the original `db` back, or wrapped it again), the site refuses to start and the error says so.
+- **`indexWith`** adds your field names to the unique index on flow + key. Sites that share step keys need it, because without it the index is flow + key alone, so a second site can't reuse a key. Even then a duplicate key is answered with a 400 "must be unique" without `indexWith`, including for a key that only another site uses, so the answer tells a caller that the key exists elsewhere. Set `indexWith` if that matters to you. You add the field yourself, in a plugin or config that runs after Wizards (`{ name: 'site', type: 'text', required: true, index: true }`, for example); naming a field that doesn't exist stops the site at start-up. If `scope` is set without `indexWith`, a warning is logged at start-up.
+- **Videos and captions:** the file-type check when a step is saved, and the files `flowSteps` returns, are looked up as the caller (`overrideAccess: false`), so a site can't attach or show another site's files. Give your media collection its own site-based read access. A file the caller can't read shows as no video.
+- **Per-site checks:** the group-with-no-active-step refusal runs inside the caller's scope. A site that never seeded its safety group is refused even when another site has one. The start-up checks (a flow registered twice, a group used twice) stay across the whole config.
+- **Versions and drafts:** with a scope set, the steps collection can't have `versions` or `drafts` (autosave included). They write through adapter calls the scope check doesn't cover, and their reads aren't scoped. If a later plugin or your config turns them on, the site refuses to start. With no scope, nothing changes.
+- **Limits:** Tested on MongoDB (replica set and standalone) and SQLite (with and without transactions).
 
 ## On its own, and with others
 
