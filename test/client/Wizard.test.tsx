@@ -316,3 +316,32 @@ describe('<Wizard>', () => {
     expect(document.cookie).toBe(cookieBefore)
   })
 })
+
+describe('<Wizard> refuses a step with a blank question or stop message', () => {
+  const blanks: [string, Step][] = [
+    ['an empty question', step({ key: 'q', question: '' })],
+    ['a question of spaces', step({ key: 'q', question: '  \n ' })],
+    ['a missing question', step({ key: 'q', question: undefined as never })],
+    ['an empty stop message on a gate', step({ key: 's', stopMessage: '' })],
+    ['a stop message of spaces on a choice', { ...choice, stopMessage: '   ' }],
+    ['a choice option with no label', { ...choice, options: [choice.options[0]!, { value: 'down', label: ' ', stops: false }] }],
+    ['an info step with no title', step({ key: 'i', kind: 'info', question: ' ' })],
+  ]
+  for (const [label, blank] of blanks) {
+    it(`shows an alert and no way to answer for ${label}, and never finishes`, () => {
+      const onFinish = vi.fn()
+      render(<Wizard slots={[{ step: blank }]} renderCode={{}} onFinish={onFinish} />)
+      expect(screen.getByRole('alert').textContent).toMatch(/can't be shown/)
+      for (const name of ['Yes', 'No', 'Next', 'Put it down', 'Still holding it']) expect(screen.queryByRole('button', { name: new RegExp(`^${name}`) }), name).toBeNull()
+      expect(onFinish).not.toHaveBeenCalled()
+    })
+  }
+
+  it('keeps Back on a blank step after a good one, and lets an info step go without a stop message', () => {
+    render(<Wizard slots={[{ step: step({ key: 'i', kind: 'info', stopMessage: '' }) }, { step: step({ key: 'q', question: ' ' }) }]} renderCode={{}} onFinish={() => {}} />)
+    fireEvent.click(btn('Next'))
+    expect(screen.getByRole('alert').textContent).toMatch(/can't be shown/)
+    fireEvent.click(btn('Back'))
+    expect(heading().textContent).toBe('Question i?')
+  })
+})

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
+import { isBlankStep } from '../blank.js'
 import type { Answer, Step } from '../types.js'
 
 /** One screen of the flow, as the server's flowSteps() returns it. */
@@ -29,6 +30,8 @@ export type WizardLabels = {
   missingCode: (code: string) => string
   /** Shown when onFinish throws or rejects. The buttons come back so the person can try again. */
   finishFailed: string
+  /** Shown instead of a step whose question, stop message or an option label is blank. There is no way to answer it. */
+  blankStep: string
   /** Visible marker on the option or button chosen earlier, so the choice isn't shown by color alone. */
   chosen: string
 }
@@ -48,6 +51,7 @@ export const defaultLabels: WizardLabels = {
   stepOf: (n, m) => `Step ${n} of ${m}`,
   missingCode: (code) => `This step ("${code}") can't be shown. Please contact the site.`,
   finishFailed: "That didn't go through. Please try again.",
+  blankStep: "This step can't be shown in your language yet, so it can't be answered. Please contact the site.",
   chosen: '(chosen)',
 }
 
@@ -126,6 +130,7 @@ export function Wizard({ slots, renderCode, onFinish, labels: labelOverrides, }:
   }, [busy, done, index])
 
   const record = (step: Step, value: string) => {
+    if (isBlankStep(step)) return
     const nextAnswers = { ...answers, [index]: { key: step.key, hash: step.hash, value } }
     setAnswers(nextAnswers)
     advance(nextAnswers, values)
@@ -149,6 +154,8 @@ export function Wizard({ slots, renderCode, onFinish, labels: labelOverrides, }:
   const progressId = `${baseId}-progress`
   const headingId = `${baseId}-heading`
   const progress = labels.stepOf(index + 1, slots.length)
+  const blank = !isCode(slot) && isBlankStep(slot.step)
+  const alertText = blank ? labels.blankStep : error
 
   const backButton =
     index > 0 ? (
@@ -163,7 +170,7 @@ export function Wizard({ slots, renderCode, onFinish, labels: labelOverrides, }:
         {stopMessage ? <p>{stopMessage}</p> : null}
       </div>
       <div role="alert" className="wizard-error">
-        {error ? <p>{error}</p> : null}
+        {alertText ? <p>{alertText}</p> : null}
       </div>
     </>
   )
@@ -204,6 +211,17 @@ export function Wizard({ slots, renderCode, onFinish, labels: labelOverrides, }:
 
   const step = slot.step
   const previous = answers[index]?.value
+
+  if (blank)
+    return (
+      <section className="wizard" data-step={step.key} aria-labelledby={progressId}>
+        <p id={progressId} className="wizard-progress" tabIndex={-1} ref={(el) => { focusTarget.current = el }}>
+          {progress}
+        </p>
+        {liveRegions}
+        <div className="wizard-nav">{backButton}</div>
+      </section>
+    )
 
   return (
     <section className="wizard" data-step={step.key} aria-labelledby={headingId} aria-busy={busy || undefined}>

@@ -2,6 +2,22 @@
 
 Kept by this repo's maintainers: after each feature or fix, and at least every 14 days while it changes. Newest first.
 
+## 2026-11-27: blank steps refused
+
+| Promise | Test |
+| --- | --- |
+| An untranslated step with fallback off is left out, listed in `blank`, and refused by `answersFor`, even with a hash worked out from the blank wording | `blank.test.ts > refuses a gate with no text…` |
+| A locale with no text and the all-locales read are refused | `… > refuses a locale with no text of its own…` |
+| Fallback on still shows and records the default language's text | `… > with fallback on…` |
+| Spaces-only question, stop message and option label refused at save | `… > refuses to save a question or option label…` |
+| Blank text that got past the save check is refused on the view and on answers (question, stop message, option label, info title) | `… > refuses at read time…` |
+| A choice with untranslated option labels is refused | `… > refuses a choice whose option has no label…` |
+| Info steps need no stop message, no step needs a body | `… > lets an info step go…` |
+| Drafts: no question refused at save and read; an untranslated published step refused | `… > refuses a draft with no question…` |
+| `<Wizard>` shows an alert and no answer buttons for each blank case, and never finishes; Back still works | client `refuses a step with a blank question or stop message` |
+
+Skipped: the unknown-kind refusal in `answersFor` (Payload's required select stops it from being stored, so no test can reach it through the API); the new server tests on MongoDB (the check reads the document Payload returns, the same on every adapter); rich text (no such field).
+
 ## 2026-11-10: after the security read
 
 | Promise | Test |

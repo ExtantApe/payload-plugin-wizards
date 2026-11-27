@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { APIError } from 'payload'
 import type { CollectionBeforeChangeHook, CollectionBeforeDeleteHook, CollectionConfig, Config, CollectionSlug, Payload, PayloadRequest, Where } from 'payload'
 
+import { hasText, isBlankStep } from './blank.js'
 import type { Answer, Flow, FlowRegistration, Req, Resolved, Step, WizardRecord } from './types.js'
 
 const configOf = (payload: Payload): Resolved => {
@@ -250,6 +251,8 @@ const beforeChange =
       // One value for a stopping and a going-on option would let the check accept either.
       if (new Set(values).size !== values.length) throw new Error('Each option in a choice step needs its own value.')
     }
+    if (!hasText(next.question)) throw new Error('A step needs a question with words in it, in each language it is saved in.')
+    if (next.kind === 'choice' && !(next.options as { label?: unknown }[]).every((x) => hasText(x?.label))) throw new Error('Each option in a choice step needs a label with words in it.')
     if (next.kind !== 'info' && !String(next.stopMessage ?? '').trim()) throw new Error('A gate or choice step needs a stop message: what to do when the answer is No.')
     if (o.media && (next.video || next.captions)) {
       const mime = async (v: unknown) => String(((await req.payload.findByID({ collection: o.media as CollectionSlug, id: idOf(v) as string, depth: 0, overrideAccess: !o.scope, req }).catch(() => null)) as { mimeType?: unknown } | null)?.mimeType ?? '')
@@ -327,9 +330,11 @@ const urlOf = (v: unknown) => (v && typeof v === 'object' && typeof (v as { url?
 
 /**
  * The content steps of a flow, in slot order, as the client shows them, in the locale asked for. Only active steps.
- * `empty` names any group of steps with no active step: the flow can't be passed until an editor fixes it.
+ * `empty` names any group of steps with no active step, and `blank` the key of any step left out because its
+ * question, its stop message or an option label is blank in that locale (with `fallback: false`, an untranslated
+ * step is blank). Either way the flow can't be passed until an editor fixes it.
  */
-export async function flowSteps(payload: Payload, args: { flow: string; locale?: string; req?: Req }): Promise<{ slots: ({ code: string } | { step: Step })[]; empty: string[] }> {
+export async function flowSteps(payload: Payload, args: { flow: string; locale?: string; req?: Req }): Promise<{ slots: ({ code: string } | { step: Step })[]; empty: string[]; blank: string[] }> {
   const o = configOf(payload)
   const scope = await scopeOf(o, args.req)
   const flows = flowsOf(payload)
@@ -348,12 +353,17 @@ export async function flowSteps(payload: Payload, args: { flow: string; locale?:
   }
   const out: ({ code: string } | { step: Step })[] = []
   const empty: string[] = []
+  const blank: string[] = []
   for (const slot of flow.slots) {
     if ('code' in slot) out.push({ code: slot.code })
     else {
       const group = docs.filter((x) => x.group === slot.steps)
       if (!group.length) empty.push(slot.steps)
       for (const d of group) {
+        if (isBlankStep(d)) {
+          blank.push(String(d.key))
+          continue
+        }
         const video = urlOf(d.video)
         const captions = urlOf(d.captions)
         out.push({
@@ -372,20 +382,21 @@ export async function flowSteps(payload: Payload, args: { flow: string; locale?:
       }
     }
   }
-  return { slots: out, empty }
+  return { slots: out, empty, blank }
 }
 
 /**
  * Checks a flow's answers on the server before the owner acts. Fails closed: every active content step must be
  * answered exactly once, with the wording the server has now in that locale (its hash), and every gate Yes and every
  * choice a non-stopping option. A group of steps with no active step fails (`noSteps`): a safety group emptied by
- * mistake never waves a flow through. A step changed since the screen loaded fails, and the person sees the new
+ * mistake never waves a flow through. A step whose question, stop message or option label is blank in that locale
+ * fails (`blankStep`), so nobody agrees to, or is recorded agreeing to, text they were never shown. A step changed since the screen loaded fails, and the person sees the new
  * wording. Returns the record to store with the action: the locale, and for each step the hash and the question as
  * the person read it, with the answer and the time. With a `scope` set, `req` is required and the check runs inside
  * the caller's scope; without it the answer is `noScope`, never all sites.
  */
-export async function answersFor(payload: Payload, args: { flow: string; answers: unknown; locale?: string; req?: Req }): Promise<{ ok: true; record: WizardRecord } | { ok: false; problem: 'noScope' | 'unknownFlow' | 'noSteps' | 'badAnswers' | 'missing' | 'extra' | 'changed' | 'notYes'; key?: string }> {
-  let flow: { slots: ({ code: string } | { step: Step })[]; empty: string[] }
+export async function answersFor(payload: Payload, args: { flow: string; answers: unknown; locale?: string; req?: Req }): Promise<{ ok: true; record: WizardRecord } | { ok: false; problem: 'noScope' | 'unknownFlow' | 'noSteps' | 'blankStep' | 'badAnswers' | 'missing' | 'extra' | 'changed' | 'notYes'; key?: string }> {
+  let flow: { slots: ({ code: string } | { step: Step })[]; empty: string[]; blank: string[] }
   try {
     flow = await flowSteps(payload, { flow: args.flow, locale: args.locale, req: args.req })
   } catch (e) {
@@ -393,6 +404,7 @@ export async function answersFor(payload: Payload, args: { flow: string; answers
     return { ok: false, problem: 'unknownFlow' }
   }
   if (flow.empty.length) return { ok: false, problem: 'noSteps', key: flow.empty[0] }
+  if (flow.blank.length) return { ok: false, problem: 'blankStep', key: flow.blank[0] }
   if (!Array.isArray(args.answers) || args.answers.some((a) => !a || typeof a !== 'object' || typeof (a as Answer).key !== 'string' || typeof (a as Answer).hash !== 'string' || typeof (a as Answer).value !== 'string')) return { ok: false, problem: 'badAnswers' }
   const answers = args.answers as Answer[]
   const steps = flow.slots.flatMap((s) => ('step' in s ? [s.step] : []))
@@ -403,6 +415,7 @@ export async function answersFor(payload: Payload, args: { flow: string; answers
     const given = byKey.get(s.key) ?? []
     if (given.length !== 1) return { ok: false, problem: given.length ? 'extra' : 'missing', key: s.key }
     const a = given[0]!
+    if (isBlankStep(s)) return { ok: false, problem: 'blankStep', key: s.key }
     if (a.hash !== s.hash) return { ok: false, problem: 'changed', key: s.key }
     if (s.kind === 'gate' && a.value !== 'yes') return { ok: false, problem: 'notYes', key: s.key }
     if (s.kind === 'info' && a.value !== 'seen') return { ok: false, problem: 'notYes', key: s.key }
@@ -410,6 +423,7 @@ export async function answersFor(payload: Payload, args: { flow: string; answers
       const opt = s.options.find((x) => x.value === a.value)
       if (!opt || opt.stops) return { ok: false, problem: 'notYes', key: s.key }
     }
+    if (s.kind !== 'gate' && s.kind !== 'info' && s.kind !== 'choice') return { ok: false, problem: 'notYes', key: s.key }
   }
   const localization = payload.config.localization
   const locale = args.locale ?? (localization ? localization.defaultLocale : null)
