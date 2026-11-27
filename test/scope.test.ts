@@ -36,6 +36,23 @@ const siteField = (c: Config): Config => ({
   collections: (c.collections ?? []).map((x) => (x.slug === 'guided-steps' ? { ...x, fields: [...x.fields, { name: 'site', type: 'text' as const, required: true, index: true }] } : x)),
 })
 
+// Host hooks that run after the plugin: a field hook and a later collection hook that can set the site, from a made-up
+// header over REST or from these variables over Local.
+let forceField: string | null = null
+let forceCollection: string | null = null
+const hostHooks = (c: Config): Config => ({
+  ...c,
+  collections: (c.collections ?? []).map((x) =>
+    x.slug === 'guided-steps'
+      ? {
+          ...x,
+          hooks: { ...x.hooks, beforeChange: [...(x.hooks?.beforeChange ?? []), ({ data }) => (forceCollection ? { ...data, site: forceCollection } : data)] },
+          fields: x.fields.map((f) => ('name' in f && f.name === 'site' ? { ...f, hooks: { beforeChange: [({ value, req }: { value?: unknown; req: { headers?: Headers } }) => forceField ?? req.headers?.get?.('x-force-site') ?? value] } } : f)),
+        }
+      : x,
+  ),
+})
+
 const config = (db: string, scope: boolean, indexWith?: string[]) =>
   buildConfig({
     secret: 'test-secret-not-for-production',
@@ -53,6 +70,7 @@ const config = (db: string, scope: boolean, indexWith?: string[]) =>
         ...(scope ? { scope: { where: ({ req }) => hook(req as never) as never, ...(indexWith ? { indexWith } : {}) } } : {}),
       }),
       siteField,
+      hostHooks,
     ],
   })
 
@@ -220,6 +238,135 @@ describe('scope fails closed', () => {
   }
 })
 
+describe('only equals and in, with non-empty scalar values, are a scope', () => {
+  const refuses = async (name: string, bad: unknown) => {
+    const good = hook
+    hook = (() => bad) as never
+    try {
+      const req = await reqOf(scoped, 'editorA')
+      const access = (scoped.collections['guided-steps' as never] as Doc).config.access as Record<string, (a: Doc) => Promise<unknown>>
+      for (const op of ['read', 'create', 'update', 'delete']) expect(await access[op]!({ req, id: 'x' }), `${name}: ${op}`).toBe(false)
+      await expect(scoped.find({ collection: 'guided-steps' as never, ...asUser('editorA') }), name).rejects.toThrow()
+      await expect(make(scoped, 'editorA', { site: 'a', key: 'op-refused', question: 'q' }), name).rejects.toThrow()
+      await expect(flowSteps(scoped, { flow: 'kit-activation', req }), name).rejects.toThrow()
+    } finally {
+      hook = good
+    }
+  }
+  const refused: [string, unknown][] = [
+    ...['not_equals', 'like', 'contains', 'greater_than', 'greater_than_equal', 'less_than', 'less_than_equal'].map((op): [string, unknown] => [op, { site: { [op]: 'a' } }]),
+    ['not_in', { site: { not_in: ['a'] } }],
+    ['exists', { site: { exists: true } }],
+    ['exists as a string', { site: { exists: 'false' } }],
+    ['equals plus a second operator', { site: { equals: 'a', not_equals: 'b' } }],
+    ['an operator inside an or', { or: [{ site: { equals: 'a' } }, { site: { like: '' } }] }],
+    ['an operator inside an and inside an or', { or: [{ and: [{ site: { contains: '' } }] }] }],
+    ['equals an empty string', { site: { equals: '' } }],
+    ['equals null', { site: { equals: null } }],
+    ['equals NaN', { site: { equals: Number.NaN } }],
+    ['equals Infinity', { site: { equals: Infinity } }],
+    ['equals a boolean', { site: { equals: true } }],
+    ['equals an object', { site: { equals: { id: 'a' } } }],
+    ['equals a list', { site: { equals: ['a'] } }],
+    ['in an empty string in the list', { site: { in: [''] } }],
+    ['in a list with a good value and an empty one', { site: { in: ['a', ''] } }],
+    ['in a list with null', { site: { in: ['a', null] } }],
+    ['in a list with an object', { site: { in: [{ id: 'a' }] } }],
+    ['in a string, not a list', { site: { in: 'a' } }],
+    ['in null', { site: { in: null } }],
+    ['an empty string in an or', { or: [{ site: { equals: 'a' } }, { site: { equals: '' } }] }],
+  ]
+  for (const [name, bad] of refused) it(`refuses ${name} on every path`, () => refuses(name, bad))
+
+  it('accepts equals and in, alone, together and inside and and or', async () => {
+    const good = hook
+    try {
+      for (const ok of [{ site: { equals: 'a' } }, { site: { in: ['a', 'zzz'] } }, { and: [{ site: { in: ['a'] } }, { site: { equals: 'a' } }] }, { or: [{ site: { equals: 'zzz' } }, { site: { equals: 'a' } }] }]) {
+        hook = (() => ok) as never
+        const doc = await make(scoped, 'editorA', { site: 'a', key: 'op-ok', question: 'q' })
+        expect(doc.site).toBe('a')
+        await expect(make(scoped, 'editorA', { site: 'b', key: 'op-ok-b', question: 'q' })).rejects.toMatchObject({ status: 403 })
+        await scoped.delete({ collection: 'guided-steps' as never, id: doc.id, overrideAccess: true })
+      }
+    } finally {
+      hook = good
+    }
+  })
+
+  it('refuses a stored site that is missing, null, a list or an object, even when its text would match', async () => {
+    const good = hook
+    const base = { flow: 'kit-activation', group: 'safety', kind: 'gate', stopMessage: 's', question: 'q' }
+    const create = async (data: Doc) => scoped.db.create({ collection: 'guided-steps' as never, data: { ...base, ...data } as never, req: await reqOf(scoped, 'editorA') })
+    try {
+      for (const [scope, site] of [
+        [{ site: { equals: 'undefined' } }, undefined],
+        [{ site: { in: ['undefined', 'null'] } }, undefined],
+        [{ site: { equals: 'null' } }, null],
+        [{ site: { in: ['null'] } }, null],
+        [{ site: { equals: 'a' } }, ['a']],
+        [{ site: { in: ['a'] } }, ['a']],
+        [{ site: { equals: 'a' } }, { id: 'a' }],
+        [{ site: { in: ['a'] } }, { id: 'a', toString: 'b' }],
+        [{ site: { equals: '[object Object]' } }, { id: 'a' }],
+      ] as [unknown, unknown][]) {
+        hook = (() => scope) as never
+        await expect(create({ key: 'weird', site }), JSON.stringify([scope, site])).rejects.toMatchObject({ status: 403 })
+      }
+      hook = (() => ({ site: { equals: 'a' } })) as never
+      const [doc] = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'a-only' } } as never, overrideAccess: true })).docs as Doc[]
+      await expect(scoped.update({ collection: 'guided-steps' as never, id: doc!.id, data: { site: { id: 'a', toString: 'b' } } as never, ...asUser('editorA') })).rejects.toThrow()
+      await expect(scoped.db.updateOne({ collection: 'guided-steps' as never, id: doc!.id, data: { site: { id: 'a', toString: 'b' } } as never, req: await reqOf(scoped, 'editorA') })).rejects.toMatchObject({ status: 403 })
+    } finally {
+      hook = good
+    }
+    expect((await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: 'weird' } } as never, overrideAccess: true })).totalDocs).toBe(0)
+    expect(((await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'a-only' } } as never, overrideAccess: true })).docs[0] as Doc).site).toBe('a')
+  })
+
+  it('refuses a bulk update or an upsert on the adapter while a scope is set', async () => {
+    const req = await reqOf(scoped, 'editorA')
+    await expect((scoped.db as Doc).updateMany({ collection: 'guided-steps', data: { site: 'a' }, where: { flow: { equals: 'kit-activation' } }, req })).rejects.toMatchObject({ status: 403 })
+    await expect((scoped.db as Doc).upsert({ collection: 'guided-steps', data: { site: 'a' }, where: { key: { equals: 'a-only' } }, req })).rejects.toMatchObject({ status: 403 })
+  })
+})
+
+describe('the scope is checked on the step as it will be stored, after every host hook', () => {
+  const post = (who: string, body: Doc, headers: Doc = {}) => handleEndpoints({ config: scoped.config, payloadInstanceCacheKey: scopedKey, request: new Request('http://localhost:3000/api/guided-steps', { method: 'POST', headers: { Authorization: `JWT ${tokens[who]}`, 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ flow: 'kit-activation', group: 'safety', kind: 'gate', stopMessage: 's', question: 'q', ...body }) }) })
+  const patch = (who: string, id: unknown, body: Doc, headers: Doc = {}) => handleEndpoints({ config: scoped.config, payloadInstanceCacheKey: scopedKey, request: new Request(`http://localhost:3000/api/guided-steps/${id}`, { method: 'PATCH', headers: { Authorization: `JWT ${tokens[who]}`, 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) }) })
+  const count = async (key: string) => (await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: key } } as never, overrideAccess: true })).totalDocs
+  const aOnly = async () => ((await scoped.find({ collection: 'guided-steps' as never, where: { and: [{ key: { equals: 'a-only' } }, { flow: { equals: 'kit-activation' } }] } as never, overrideAccess: true })).docs[0]) as Doc
+
+  for (const [label, set] of [['a field hook', (v: string | null) => { forceField = v }], ['a collection hook added after the plugin', (v: string | null) => { forceCollection = v }]] as const) {
+    it(`cannot move a create or an update to another site with ${label}, over Local`, async () => {
+      set('b')
+      try {
+        await expect(make(scoped, 'editorA', { site: 'a', key: 'hooked', question: 'q' })).rejects.toMatchObject({ status: 403 })
+        const doc = await aOnly()
+        await expect(scoped.update({ collection: 'guided-steps' as never, id: doc.id, data: { question: 'moved by a hook' } as never, ...asUser('editorA') })).rejects.toMatchObject({ status: 403 })
+        // The same hook for the other editor lands on its own site, which is allowed.
+        await expect(make(scoped, 'editorB', { site: 'a', key: 'hooked-b', question: 'q' })).resolves.toMatchObject({ site: 'b' })
+      } finally {
+        set(null)
+      }
+      expect(await count('hooked')).toBe(0)
+      expect((await aOnly()).site).toBe('a')
+      expect((await aOnly()).question).toBe('Only on site A?')
+      for (const d of (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'hooked-b' } } as never, overrideAccess: true })).docs as Doc[]) await scoped.delete({ collection: 'guided-steps' as never, id: d.id, ...asUser('editorB') })
+    })
+  }
+
+  it('cannot move a create or an update to another site with a header-driven field hook, over REST', async () => {
+    expect((await post('editorA', { site: 'a', key: 'rest-hooked' }, { 'x-force-site': 'b' })).status).toBe(403)
+    expect((await patch('editorA', (await aOnly()).id, { question: 'rest moved' }, { 'x-force-site': 'b' })).status).toBe(403)
+    expect(await count('rest-hooked')).toBe(0)
+    expect((await aOnly()).site).toBe('a')
+    // Without the header the same calls work, so the refusals came from the check.
+    const ok = await post('editorA', { site: 'a', key: 'rest-fine' })
+    expect(ok.status).toBe(201)
+    for (const d of (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'rest-fine' } } as never, overrideAccess: true })).docs as Doc[]) await scoped.delete({ collection: 'guided-steps' as never, id: d.id, ...asUser('editorA') })
+  })
+})
+
 describe('writes stay inside the caller’s site', () => {
   it('creates in the caller’s site, and refuses a create into another site, leaving nothing behind', async () => {
     await expect(make(scoped, 'editorA', { site: 'a', key: 'new-a', question: 'q' })).resolves.toBeTruthy()
@@ -358,7 +505,7 @@ describe('media is looked up as the caller', () => {
     expect(steps.find((x) => x.key === 'has-video')!.video?.url).toMatch(/\/a(-\d+)?\.mp4$/)
     // If the file ends up outside the site, the step shows no video rather than the other site's file.
     const [doc] = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'has-video' } } as never, overrideAccess: true })).docs as Doc[]
-    await scoped.db.updateOne({ collection: 'guided-steps' as never, id: doc!.id, data: { video: bVideo.id, captions: bVtt.id } as never, req: await reqOf(scoped, 'editorA') })
+    await scoped.db.updateOne({ collection: 'guided-steps' as never, id: doc!.id, data: { site: 'a', video: bVideo.id, captions: bVtt.id } as never, req: await reqOf(scoped, 'editorA') })
     const after = (await flowSteps(scoped, { flow: 'kit-activation', req: await reqOf(scoped, 'editorA') })).slots.flatMap((s) => ('step' in s ? [s.step] : []))
     expect(after.find((x) => x.key === 'has-video')!.video).toBeNull()
   })

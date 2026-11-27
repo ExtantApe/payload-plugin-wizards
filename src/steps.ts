@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 import { APIError } from 'payload'
-import type { CollectionBeforeChangeHook, CollectionBeforeDeleteHook, CollectionConfig, CollectionSlug, Payload, PayloadRequest, Where } from 'payload'
+import type { CollectionBeforeChangeHook, CollectionBeforeDeleteHook, CollectionConfig, Config, CollectionSlug, Payload, PayloadRequest, Where } from 'payload'
 
 import type { Answer, Flow, FlowRegistration, Req, Resolved, Step, WizardRecord } from './types.js'
 
@@ -24,13 +24,15 @@ const isObject = (v: unknown): v is Record<string, unknown> => {
   return proto === Object.prototype || proto === null
 }
 
-const COMPARE = ['greater_than', 'greater_than_equal', 'less_than', 'less_than_equal']
-const OPERATORS = ['equals', 'not_equals', 'in', 'not_in', 'exists', 'contains', 'like', ...COMPARE]
+/** A value a scope may compare to: a non-empty string or a finite number. Nothing else is allowed, so nothing can match everything. */
+const scalar = (v: unknown): v is string | number => (typeof v === 'string' && v !== '') || (typeof v === 'number' && Number.isFinite(v))
 
 /**
- * A scope is safe to apply only if it can't match everything by accident. At every depth: `and` and `or` are
- * non-empty arrays of scopes, a field maps to a non-empty object of known operators, no value is undefined, and
- * `in` and `not_in` lists aren't empty. Plain objects only. A deliberate match-all is the host's own choice.
+ * A scope is safe to apply only if it can't match everything by accident and means the same thing in memory and in
+ * every database. At every depth: `and` and `or` are non-empty arrays of scopes, and a field maps to a non-empty
+ * object of `equals` (one non-empty string or finite number) and `in` (a non-empty list of them). Any other operator,
+ * an empty or null value and anything not recognized is refused. Plain objects only. A deliberate match-all is the
+ * host's own choice, made without the scope option.
  */
 const validScope = (w: unknown): w is Where => {
   if (!isObject(w)) return false
@@ -41,35 +43,24 @@ const validScope = (w: unknown): w is Where => {
     if (k === 'and' || k === 'or') return Array.isArray(v) && v.length > 0 && v.every(validScope)
     if (!isObject(v)) return false
     const ops = Object.keys(v)
-    return ops.length > 0 && ops.every((op) => OPERATORS.includes(op) && v[op] !== undefined && !((op === 'in' || op === 'not_in') && !(Array.isArray(v[op]) && (v[op] as unknown[]).length > 0)))
+    return ops.length > 0 && ops.every((op) => (op === 'equals' ? scalar(v[op]) : op === 'in' ? Array.isArray(v[op]) && (v[op] as unknown[]).length > 0 && (v[op] as unknown[]).every(scalar) : false))
   })
 }
 
-const norm = (v: unknown): unknown => (v && typeof v === 'object' ? (v instanceof Date ? v.toISOString() : 'id' in v ? String((v as { id: unknown }).id) : v) : v == null ? v : String(v))
 const pathValue = (doc: Doc, path: string): unknown => path.split('.').reduce<unknown>((acc, k) => (acc && typeof acc === 'object' ? (acc as Doc)[k] : undefined), doc)
 
-/** Whether a document (as it would be saved) matches a validated scope, worked out in memory before anything is written. */
+/**
+ * Whether a document (as it will be saved) matches a validated scope. A stored value that isn't a string or a number
+ * (an object, a list, null, nothing) matches nothing, so a write the databases would read differently is refused.
+ */
 const matches = (doc: Doc, w: Where): boolean =>
   Object.entries(w).every(([k, v]) => {
     if (k === 'and') return (v as Where[]).every((x) => matches(doc, x))
     if (k === 'or') return (v as Where[]).some((x) => matches(doc, x))
-    const val = norm(pathValue(doc, k))
-    return Object.entries(v as Record<string, unknown>).every(([op, arg]) => {
-      switch (op) {
-        case 'equals': return val != null && val === norm(arg)
-        case 'not_equals': return val !== norm(arg)
-        case 'in': return val != null && (arg as unknown[]).map(norm).includes(val)
-        case 'not_in': return !(arg as unknown[]).map(norm).includes(val)
-        case 'exists': return (val != null) === Boolean(arg)
-        case 'contains':
-        case 'like': return typeof val === 'string' && val.toLowerCase().includes(String(arg).toLowerCase())
-        default: {
-          if (val == null) return false
-          const [x, y] = typeof val === 'string' && Number.isNaN(Number(val)) ? [val, String(norm(arg))] : [Number(val), Number(norm(arg))]
-          return op === 'greater_than' ? x > y : op === 'greater_than_equal' ? x >= y : op === 'less_than' ? x < y : x <= y
-        }
-      }
-    })
+    const raw = pathValue(doc, k)
+    if (typeof raw !== 'string' && typeof raw !== 'number') return false
+    const val = String(raw)
+    return Object.entries(v as Record<string, unknown>).every(([op, arg]) => (op === 'equals' ? val === String(arg) : op === 'in' ? (arg as unknown[]).map(String).includes(val) : false))
   })
 
 /**
@@ -85,7 +76,7 @@ const scopeOf = async (o: Resolved, req: Req | undefined): Promise<Where | null>
   } catch {
     throw new ScopeError('Wizards: the scope hook threw, so the call is refused.')
   }
-  if (!validScope(w)) throw new ScopeError('Wizards: the scope hook must return a non-empty filter with no empty and/or lists or empty operator objects, so the call is refused.')
+  if (!validScope(w)) throw new ScopeError('Wizards: the scope hook must return a non-empty filter that uses only `equals` and `in`, with non-empty string or number values, so the call is refused.')
   return w
 }
 
@@ -106,6 +97,42 @@ const withScope = async (o: Resolved, req: Req, result: boolean | Where): Promis
 const checkWrite = async (o: Resolved, next: Doc, req: Req) => {
   const scope = await scopeOf(o, req)
   if (scope && !matches(next, scope)) throw new ScopeError('This step would be outside your scope.')
+}
+
+type Method = (this: unknown, args: Doc) => Promise<unknown>
+
+/**
+ * Puts the scope check at the one place every save passes last: the database adapter's create and update, which
+ * receive the step exactly as it will be stored, after every field hook and every collection hook any plugin added,
+ * whatever order the plugins run in. Anything else that could write a step without a check (a bulk update or an
+ * upsert straight on the adapter) is refused while a scope is set.
+ */
+export const guardDb = (o: Resolved, db: Config['db'] | undefined): Config['db'] => {
+  if (!o.scope) return db as Config['db']
+  if (!db || typeof db.init !== 'function') throw new Error('Wizards: a scope needs `db` set before this plugin, so the check can sit at the database.')
+  return {
+    ...db,
+    init: (args) => {
+      const adapter = db.init(args) as unknown as Record<string, Method | undefined>
+      for (const name of ['create', 'updateOne'] as const) {
+        const original = adapter[name]
+        if (typeof original !== 'function') throw new Error(`Wizards: the database adapter has no ${name}, so the scope can't be enforced.`)
+        adapter[name] = async function (this: unknown, a: Doc) {
+          if (a?.collection === o.slug) await checkWrite(o, (a.data ?? {}) as Doc, a.req as Req)
+          return original.call(this, a)
+        }
+      }
+      for (const name of ['updateMany', 'upsert'] as const) {
+        const original = adapter[name]
+        if (typeof original !== 'function') continue
+        adapter[name] = async function (this: unknown, a: Doc) {
+          if (a?.collection === o.slug) throw new ScopeError(`Wizards: ${name} on the steps is refused while a scope is set.`)
+          return original.call(this, a)
+        }
+      }
+      return adapter as never
+    },
+  }
 }
 
 /** Refuses, before the delete, a step outside the caller's scope. */
@@ -138,7 +165,7 @@ const beforeChange =
   (o: Resolved): CollectionBeforeChangeHook =>
   async ({ data, originalDoc, req }) => {
     const next = { ...originalDoc, ...data }
-    await checkWrite(o, next, req)
+    // The scope is checked later, at the database, once every hook has run.
     if (next.video && !next.captions) throw new Error('A step with a video needs its captions (a WebVTT file).')
     if (next.kind === 'choice' && !(Array.isArray(next.options) && next.options.length >= 2)) throw new Error('A choice step needs at least two options.')
     if (next.kind === 'choice') {

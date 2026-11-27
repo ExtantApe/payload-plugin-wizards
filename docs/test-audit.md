@@ -50,3 +50,25 @@ All of `test/scope.test.ts` runs four times: MongoDB replica set, MongoDB standa
 Failing-first, as the review measured it: on main the new file's setup fails at the unique flow + key index, because two sites share a key. With that index dropped, 18 of the first 21 tests failed for the right reason and the 3 controls passed. The first build had a rollback-based write check that these tests passed on Mongo with transactions and missed on the other databases; running all four now covers that.
 
 Gaps skipped: Postgres (the checks use no database-specific code, but only Mongo and SQLite were run) and versions (the collection has none).
+
+## 2026-11-27: scope limited to equals and in, and checked last
+
+`test/scope.test.ts` still runs on four databases: MongoDB replica set, MongoDB standalone, SQLite with default settings and SQLite with transactions on. It now has 71 tests on each, 284 in all, and 316 with the other two files.
+
+What changed: a scope may use only `equals` and `in` with non-empty string or number values, and the write check moved to the database adapter, where it sees the step exactly as it will be stored.
+
+| Promise | Test |
+| --- | --- |
+| Each other operator is refused on every path (access functions, find, create, `flowSteps`): `not_equals`, `not_in`, `exists`, `like`, `contains`, the four comparisons, a second operator beside `equals`, an operator inside an or, and inside an and inside an or | `only equals and in…` (one test per case) |
+| Empty string, null, NaN, Infinity, boolean, object and list operands to `equals`; `['']`, null, object and string operands to `in`; an empty string in an or | `only equals and in…` |
+| `equals` and `in` still work alone, together, and inside and and or; a write to another site is refused with a 403 | `accepts equals and in…` |
+| A stored site that is missing, null, a list or an object is refused even when its text would match (`'undefined'`, `'null'`, `'a'` for `['a']`, `{ id: 'a', toString: 'b' }`), on create and update | `refuses a stored site that is missing…` |
+| `updateMany` and `upsert` on the adapter are refused while a scope is set | `refuses a bulk update or an upsert…` |
+| A host field hook and a later host collection hook that set the site to another site cannot move a create or an update there, over Local; a header-driven field hook cannot, over REST (403, nothing stored, the step stays put) | `the scope is checked on the step as it will be stored…` |
+
+Failing-first: run against the previous `src/`, 126 of the 284 scope tests failed (the new tests only; the old ones passed), and with the new `src/` all 316 pass. One older test calls `db.updateOne` with a partial step, which the adapter check now refuses, so it passes the site too.
+
+Mutants the new tests are meant to kill: every operator outside `equals` and `in` accepted, empty or null operands accepted, the null and non-scalar guard on stored values removed, the check placed before field hooks, and the check placed before later collection hooks.
+
+Gaps skipped: a plugin that replaces `db` after Wizards (the README says to set `db` first), Postgres, and versions (the collection has none). The repo has no lint script, so lint was not run.
+

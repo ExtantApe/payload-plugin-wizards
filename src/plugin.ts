@@ -1,6 +1,6 @@
 import type { Access, Config, Plugin } from 'payload'
 
-import { flowsOf, stepsCollection } from './steps.js'
+import { flowsOf, guardDb, stepsCollection } from './steps.js'
 import type { Resolved, WizardsOptions } from './types.js'
 
 /** Wizards: gated step-by-step flows, steps edited in the admin, and answers checked on the server. */
@@ -14,6 +14,7 @@ export const wizardsPlugin =
     if (o.media && !(config.collections ?? []).some((c) => c.slug === o.media && c.upload)) throw new Error(`Wizards: "${o.media}" isn't an upload collection. Set \`media\`, or false for no videos.`)
     return {
       ...config,
+      db: guardDb(o, config.db),
       custom: { ...config.custom, wizards: o },
       collections: [...(config.collections ?? []), stepsCollection(o)],
       onInit: async (payload) => {
