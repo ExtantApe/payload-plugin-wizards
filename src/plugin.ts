@@ -1,6 +1,6 @@
 import type { Access, Config, Plugin } from 'payload'
 
-import { flowsOf, guardDb, stepsCollection } from './steps.js'
+import { assertGuarded, flowsOf, guardDb, stepsCollection } from './steps.js'
 import type { Resolved, WizardsOptions } from './types.js'
 
 /** Wizards: gated step-by-step flows, steps edited in the admin, and answers checked on the server. */
@@ -19,6 +19,7 @@ export const wizardsPlugin =
       collections: [...(config.collections ?? []), stepsCollection(o)],
       onInit: async (payload) => {
         flowsOf(payload)
+        assertGuarded(o, payload)
         if (o.scope && !o.scope.indexWith?.length) payload.logger.warn('Wizards: scope is set without indexWith, so two sites can’t use the same step key. Add indexWith (and the field) if sites share keys.')
         await config.onInit?.(payload)
       },

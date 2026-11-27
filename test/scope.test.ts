@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { answersFor, flowSteps, wizardsPlugin, type Answer } from '../src/index.js'
+import { guardDb, ScopeError } from '../src/steps.js'
 
 // The schema builder loads graphql as CommonJS, so the test must too: two copies of the library refuse to work together.
 const { graphql } = createRequire(import.meta.url)('graphql') as typeof import('graphql')
@@ -526,4 +527,169 @@ describe('start-up', () => {
   })
 })
 
+describe('the stored step is checked too, not only the incoming data', () => {
+  const stored = async (key: string) => ((await scoped.find({ collection: 'guided-steps' as never, where: { and: [{ key: { equals: key } }, { flow: { equals: 'kit-activation' } }] } as never, overrideAccess: true })).docs[0]) as Doc
+  const anyDb = () => scoped.db as unknown as Doc
+
+  it('refuses an overrideAccess update that sets site a on site b’s step, and the step stays on b', async () => {
+    const b = await stored('b-only')
+    await expect(scoped.update({ collection: 'guided-steps' as never, id: b.id, data: { site: 'a', question: 'taken over' } as never, overrideAccess: true, user: users.editorA as never })).rejects.toMatchObject({ status: 403 })
+    const after = await stored('b-only')
+    expect(after.site).toBe('b')
+    expect(after.question).toBe('Only on site B?')
+  })
+
+  it('refuses db.updateOne with site a’s request on site b’s step, by id and by where', async () => {
+    const b = await stored('b-only')
+    const req = await reqOf(scoped, 'editorA')
+    await expect(anyDb().updateOne({ collection: 'guided-steps', id: b.id, data: { site: 'a' }, req })).rejects.toMatchObject({ status: 403 })
+    await expect(anyDb().updateOne({ collection: 'guided-steps', where: { id: { equals: b.id } }, data: { site: 'a' }, req })).rejects.toMatchObject({ status: 403 })
+    expect((await stored('b-only')).site).toBe('b')
+  })
+
+  it('still lets db.updateOne change a step on the caller’s own site', async () => {
+    const a = await stored('a-only')
+    await anyDb().updateOne({ collection: 'guided-steps', id: a.id, data: { site: 'a', question: 'Only on site A?' }, req: await reqOf(scoped, 'editorA') })
+    expect((await stored('a-only')).site).toBe('a')
+  })
+
+  it('refuses db.deleteOne and db.deleteMany from site a that would reach site b’s step, and deletes nothing', async () => {
+    const b = await stored('b-only')
+    const req = await reqOf(scoped, 'editorA')
+    const total = async () => (await scoped.count({ collection: 'guided-steps' as never, overrideAccess: true })).totalDocs
+    const before = await total()
+    await expect(anyDb().deleteOne({ collection: 'guided-steps', where: { id: { equals: b.id } }, req })).rejects.toMatchObject({ status: 403 })
+    // A where that matches both sites’ steps is refused whole, so site a’s own steps are not deleted either.
+    await expect(anyDb().deleteMany({ collection: 'guided-steps', where: { flow: { equals: 'kit-activation' } }, req })).rejects.toMatchObject({ status: 403 })
+    await expect(anyDb().deleteMany({ collection: 'guided-steps', where: {}, req })).rejects.toMatchObject({ status: 403 })
+    expect(await total()).toBe(before)
+    expect((await stored('b-only')).site).toBe('b')
+  })
+
+  it('lets db.deleteOne and db.deleteMany delete steps that are all on the caller’s site', async () => {
+    const req = await reqOf(scoped, 'editorA')
+    await make(scoped, 'editorA', { site: 'a', key: 'tmp-1', question: 'q' })
+    await make(scoped, 'editorA', { site: 'a', key: 'tmp-2', question: 'q' })
+    const tmp = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { like: 'tmp-' } } as never, overrideAccess: true })).docs as Doc[]
+    expect(tmp).toHaveLength(2)
+    await anyDb().deleteOne({ collection: 'guided-steps', where: { id: { equals: tmp.find((d) => d.key === 'tmp-1')!.id } }, req })
+    await anyDb().deleteMany({ collection: 'guided-steps', where: { key: { equals: 'tmp-2' } }, req })
+    const left = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { like: 'tmp-' } } as never, overrideAccess: true })).docs as Doc[]
+    expect(left.map((d) => d.key)).toEqual([])
+  })
+
+  it('refuses db calls with no req while a scope is set, and leaves other collections alone', async () => {
+    const b = await stored('b-only')
+    await expect(anyDb().deleteOne({ collection: 'guided-steps', where: { id: { equals: b.id } } })).rejects.toMatchObject({ status: 403 })
+    expect((await scoped.count({ collection: 'users' as never, overrideAccess: true })).totalDocs).toBeGreaterThan(0)
+  })
+})
+
+describe('versions and drafts are refused while a scope is set', () => {
+  const withVersions = (versions: unknown) => (c: Config): Config => ({ ...c, collections: (c.collections ?? []).map((x) => (x.slug === 'guided-steps' ? ({ ...x, versions } as never) : x)) })
+  const boot = async (key: string, plugin: (c: Config) => Config, scope = true) => {
+    const p = await getPayload({
+      key,
+      config: await buildConfig({
+        secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: makeDb(key),
+        collections: [{ slug: 'users', auth: true, fields: [{ name: 'site', type: 'text' }] }],
+        plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, ...(scope ? { scope: { where: () => ({ site: { equals: 'a' } }), indexWith: ['site'] } } : {}) }), siteField, plugin],
+      } as never),
+    })
+    await p.destroy()
+  }
+
+  for (const [label, versions] of [['versions: true', true], ['drafts', { drafts: true }], ['drafts with autosave', { drafts: { autosave: true } }]] as const)
+    it(`refuses to start with ${label} on the steps`, async () => {
+      await expect(boot(`ver${n}${label.length}`, withVersions(versions))).rejects.toThrow(/can.t have versions or drafts/)
+    })
+
+  it('does not touch the same config with no scope', async () => {
+    await expect(boot(`ver-open${n}`, withVersions({ drafts: true }), false)).resolves.toBeUndefined()
+  })
+
+  it('a draft or autosave write can’t move a step to another site, and the step stays put', async () => {
+    const [a] = (await scoped.find({ collection: 'guided-steps' as never, where: { and: [{ key: { equals: 'a-only' } }, { flow: { equals: 'kit-activation' } }] } as never, overrideAccess: true })).docs as Doc[]
+    for (const extra of [{ draft: true }, { draft: true, autosave: true }])
+      await expect(scoped.update({ collection: 'guided-steps' as never, id: a!.id, data: { site: 'b' } as never, ...extra, ...asUser('editorA') })).rejects.toMatchObject({ status: 403 })
+    await expect(scoped.create({ collection: 'guided-steps' as never, data: { flow: 'kit-activation', group: 'safety', kind: 'gate', stopMessage: 's', site: 'b', key: 'drafted', question: 'q' } as never, draft: true, ...asUser('editorA') })).rejects.toMatchObject({ status: 403 })
+    const res = await handleEndpoints({ config: scoped.config, payloadInstanceCacheKey: scopedKey, request: new Request(`http://localhost:3000/api/guided-steps/${a!.id}?draft=true`, { method: 'PATCH', headers: { Authorization: `JWT ${tokens.editorA}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ site: 'b' }) }) })
+    expect(res.status).toBe(403)
+    expect(((await scoped.findByID({ collection: 'guided-steps' as never, id: a!.id, overrideAccess: true })) as Doc).site).toBe('a')
+    expect((await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: 'drafted' } } as never, overrideAccess: true })).totalDocs).toBe(0)
+  })
+
+  it('findVersions has nothing to read: the steps have no versions, so no other site’s versions come back', async () => {
+    await expect(scoped.findVersions({ collection: 'guided-steps' as never, ...asUser('editorB') })).rejects.toThrow()
+    const res = await handleEndpoints({ config: scoped.config, payloadInstanceCacheKey: scopedKey, request: new Request('http://localhost:3000/api/guided-steps/versions', { headers: { Authorization: `JWT ${tokens.editorB}` } }) })
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect((scoped.config.collections.find((c) => c.slug === 'guided-steps') as Doc).versions).toBeFalsy()
+  })
+})
+
+describe('plugin order: the final database adapter must still carry the check', () => {
+  const boot = async (key: string, plugins: ((c: Config) => Config)[]) => {
+    const base = makeDb(key)
+    const p = await getPayload({
+      key,
+      config: await buildConfig({
+        secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: base,
+        collections: [{ slug: 'users', auth: true, fields: [{ name: 'site', type: 'text' }] }],
+        plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }), indexWith: ['site'] } }), siteField, ...plugins.map((f) => (c: Config) => f({ ...c, custom: { ...c.custom, base } }))],
+      } as never),
+    })
+    await p.destroy()
+  }
+
+  it('refuses to start when a later plugin puts the original config.db back', async () => {
+    await expect(boot(`order-restore${n}`, [(c) => ({ ...c, db: (c.custom as Doc).base })])).rejects.toThrow(/not the one this plugin wrapped/)
+  })
+
+  it('refuses to start when a later plugin wraps create outside the check', async () => {
+    const wrap = (c: Config): Config => ({ ...c, db: { ...c.db, init: (a: { payload: Payload }) => { const ad = c.db.init(a as never) as unknown as Doc; const inner = ad.create; return { ...ad, create: (x: Doc) => inner.call(ad, x) } as never } } })
+    await expect(boot(`order-wrap${n}`, [wrap])).rejects.toThrow(/Put .wizardsPlugin. last/)
+  })
+
+  it('starts when no plugin touches db after it', async () => {
+    await expect(boot(`order-ok${n}`, [])).resolves.toBeUndefined()
+  })
+})
+
+})
+
+// The start-up refusals of guardDb, directly, so each can be removed on its own and a test notices.
+describe('guardDb refuses what it can’t guard', () => {
+  const o = { scope: { where: () => ({ site: { equals: 'a' } }) }, slug: 'guided-steps', flows: {}, edit: () => true, media: false, adminGroup: 'Wizards' } as never
+  const fn = async () => ({})
+  const full = { count: fn, create: fn, updateOne: fn, deleteOne: fn, deleteMany: fn }
+  const init = (adapter: Record<string, unknown>) => (guardDb(o, { init: () => adapter } as never) as { init: (a: never) => unknown }).init({} as never)
+
+  it('throws when db is missing, or has no init', () => {
+    expect(() => guardDb(o, undefined)).toThrow(/needs `db` set before this plugin/)
+    expect(() => guardDb(o, {} as never)).toThrow(/needs `db` set before this plugin/)
+  })
+
+  it('throws when the adapter lacks count, create, updateOne, deleteOne or deleteMany, naming it', () => {
+    for (const name of Object.keys(full)) {
+      const { [name]: _gone, ...rest } = full as Record<string, unknown>
+      expect(() => init(rest)).toThrow(new RegExp(`no ${name}`))
+    }
+  })
+
+  it('wraps a complete adapter, and passes everything through with no scope', () => {
+    const wrapped = init({ ...full, updateMany: fn, upsert: fn }) as Record<string, unknown>
+    for (const name of ['create', 'updateOne', 'deleteOne', 'deleteMany', 'updateMany', 'upsert']) expect(wrapped[name]).not.toBe((full as Record<string, unknown>)[name] ?? fn)
+    const db = { init: () => ({}) } as never
+    expect(guardDb({ ...(o as object), scope: undefined } as never, db)).toBe(db)
+  })
+
+  it('a scope error is a 403, the same status for each refusal', async () => {
+    expect(new ScopeError('x').status).toBe(403)
+    const wrapped = init(full) as Doc
+    await expect(wrapped.create({ collection: 'guided-steps', data: { site: 'a' } })).rejects.toMatchObject({ status: 403, isPublic: true })
+  })
+
+  it('refuses at config time when a scope is set and no db is given', async () => {
+    await expect(buildConfig({ secret: 's', telemetry: false, collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }) } })] } as never)).rejects.toThrow(/needs `db` set before this plugin/)
+  })
 })

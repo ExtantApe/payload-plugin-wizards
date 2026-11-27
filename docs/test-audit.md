@@ -51,7 +51,7 @@ Failing-first, as the review measured it: on main the new file's setup fails at 
 
 Gaps skipped: Postgres (the checks use no database-specific code, but only Mongo and SQLite were run) and versions (the collection has none).
 
-## 2026-11-27: scope limited to equals and in, and checked last
+## 2026-11-26: scope limited to equals and in, and checked last
 
 `test/scope.test.ts` still runs on four databases: MongoDB replica set, MongoDB standalone, SQLite with default settings and SQLite with transactions on. It now has 71 tests on each, 284 in all, and 316 with the other two files.
 
@@ -72,3 +72,18 @@ Mutants the new tests are meant to kill: every operator outside `equals` and `in
 
 Gaps skipped: a plugin that replaces `db` after Wizards (the README says to set `db` first), Postgres, and versions (the collection has none). The repo has no lint script, so lint was not run.
 
+## 2026-11-26: stored step, versions and drafts, plugin order
+
+`test/scope.test.ts` now has 86 tests on each of four databases (MongoDB replica set, MongoDB standalone, SQLite default, SQLite with transactions) and 5 start-up tests that need no database, 349 in all, 381 with the other two files.
+
+| Promise | Test |
+| --- | --- |
+| An update or delete checks the stored step: an `overrideAccess` update that sets the caller's site on another site's step, `db.updateOne` by id and by where, `db.deleteOne` and `db.deleteMany` that reach another site's step are refused with a 403 and change nothing; a `where` matching both sites is refused whole; own-site calls still work; no `req` is refused | `the stored step is checked too…` (6 tests) |
+| With a scope set the site refuses to start if the steps have `versions: true`, drafts or drafts with autosave; with no scope they are allowed | `versions and drafts are refused…` |
+| A draft or autosave write, a draft create and a REST `PATCH ?draft=true` can't move a step to another site; `findVersions` returns nothing of another site | same group (locks: they passed before, because the steps had no versions) |
+| The site refuses to start when a later plugin restores the original `config.db` or wraps `create` outside the check | `plugin order…` |
+| The start-up throws for a missing `db` and for an adapter without `count`, `create`, `updateOne`, `deleteOne` or `deleteMany`, and the 403 status | `guardDb refuses what it can't guard` |
+
+Failing-first: against the previous `src/`, 38 of the 65 new tests failed (the stored-step, versions, plugin order and two adapter tests). The other 27 are locks that pass on both: the no-scope control, own-site calls, the draft and findVersions tests, and the start-up refusals that already existed. Those were checked by mutation instead: removing the missing-`db` throw, the missing-method throw, the stored-step check, the versions check or the guarded-function check, or changing 403 to 400, each makes tests fail.
+
+Gaps skipped: Postgres, two writes at once (the stored-step check reads first and writes after), a plugin that wraps `db` before this one (it can't be detected, so the README says to list this plugin last), and the admin autosave UI.
