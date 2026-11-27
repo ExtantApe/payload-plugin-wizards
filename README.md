@@ -12,20 +12,22 @@ Wizards for Payload: gated step-by-step flows, one question per screen with Yes 
   - **choice:** options, any of which can stop the flow.
 
   Each step also has its question, a text version, an optional video with required captions, a stop message, and active or not.
-  - Every gate and choice needs a stop message, which says what to do when the answer is No. A choice's options each need their own value.
+  - Every step needs a question, and every gate and choice a stop message, which says what to do when the answer is No. Text that is only spaces doesn't count. A choice's options each need their own value and a label.
   - A video has to be a video file, and its captions a WebVTT file.
   - Each step's content hash covers what a person confirms (question, text, kind, options, stop message, video and captions) in the language they read it. It's worked out each time a step is read, so it can't go stale.
   - Editors (`access.edit`, required) change steps. The public reads active ones only.
 - **Flows are registered in code:** a list of slots, either your own code steps (finding a kit with the camera, choosing an animal) or a group of content steps. Other plugins register flows at `config.custom.wizardFlows` with no import, and a flow registered twice, or one that uses a group of steps twice, stops the site at start-up.
-- **`flowSteps(payload, { flow, locale, req })`** gives the flow's slots, with active steps in order, for the page.
+- **`flowSteps(payload, { flow, locale, req })`** gives the flow's slots, with active steps in order, for the page. A step whose question, stop message or an option label is blank in that language is left out and named in `blank`. With `localization.fallback: false`, an untranslated step is blank. Show an error instead of the flow when `blank` or `empty` has anything in it.
 - **`<Wizard>`** (`./client`) shows one step per screen:
   - focus on the question, "Step N of M", and Back;
   - No shows the stop message and stays, and withdraws an earlier Yes on that step;
   - video with captions, never autoplaying, and the text version always shown;
   - your code steps rendered with `next` and `back`;
+  - a step with a blank question, stop message or option label shows an alert in place of the step, with no way to answer it;
   - state in memory only.
 - **The answers are checked on the server, not trusted.** Call `answersFor(payload, { flow, answers, req })` before acting. It refuses:
   - a No, or a stopping choice;
+  - a step whose question, stop message or an option label is blank in the language asked for (`blankStep`), so nobody is recorded agreeing to text they weren't shown;
   - a missing, extra or repeated step;
   - a group of steps with no active step, so a safety group that was never seeded, is misspelled or was switched off never waves the flow through;
   - any step whose wording changed since the screen loaded;

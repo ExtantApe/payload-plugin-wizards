@@ -2,6 +2,25 @@
 
 Kept by this repo's maintainers: after each feature or fix, and at least every 14 days while it changes. Newest first.
 
+## 2026-11-27: blank steps refused
+
+| Promise | Test |
+| --- | --- |
+| An untranslated step with fallback off is left out, listed in `blank`, and refused by `answersFor`, even with a hash worked out from the blank wording | `blank.test.ts > refuses a gate with no text…` |
+| A locale with no text and the all-locales read are refused | `… > refuses a locale with no text of its own…` |
+| Fallback on still shows and records the default language's text | `… > with fallback on…` |
+| Spaces-only question, stop message and option label refused at save | `… > refuses to save a question or option label…` |
+| Blank text that got past the save check is refused on the view and on answers (question, stop message, option label, info title) | `… > refuses at read time…` |
+| A choice with untranslated option labels is refused | `… > refuses a choice whose option has no label…` |
+| Info steps need no stop message, no step needs a body | `… > lets an info step go…` |
+| Drafts: no question refused at save and read; an untranslated published step refused | `… > refuses a draft with no question…` |
+| `<Wizard>` shows an alert and no answer buttons for each blank case, and never finishes; Back still works | client `refuses a step with a blank question or stop message` |
+
+| Invisible-only text (15 cases, NUL and a lone combining mark among them) refused at save and read in each field; emoji, non-Latin and joined text pass | `… > counts only text…`, `… > refuses to save…invisible…`, `… > refuses on the view…invisible…`, `… > saves, shows and passes emoji…`, client cases |
+| An empty locale records the default language | `… > records the default language…` |
+
+Skipped: the unknown-kind refusal in `answersFor` (Payload's required select stops it from being stored, so no test can reach it through the API); the new server tests on MongoDB (the check reads the document Payload returns, the same on every adapter); rich text (no such field).
+
 ## 2026-11-27: sweep of every promise
 
 The promises in the README, `docs/decisions.md`, design 0001 and the code's own comments were listed and matched to tests. The suite went from 431 tests to 450: 15 more server tests, 3 more in the database check tests that need no site, and 1 more component test. Two older tests got more assertions (the content hash, and what the component stores or sends). Nothing in `src/` changed.
