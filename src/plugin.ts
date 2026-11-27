@@ -18,6 +18,7 @@ export const wizardsPlugin =
       collections: [...(config.collections ?? []), stepsCollection(o)],
       onInit: async (payload) => {
         flowsOf(payload)
+        if (o.scope && !o.scope.indexWith?.length) payload.logger.warn('Wizards: scope is set without indexWith, so two sites can’t use the same step key. Add indexWith (and the field) if sites share keys.')
         await config.onInit?.(payload)
       },
     }

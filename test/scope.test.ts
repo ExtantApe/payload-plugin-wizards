@@ -1,13 +1,14 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { configToSchema } from '@payloadcms/graphql'
 import { createRequire } from 'node:module'
-import { MongoMemoryReplSet } from 'mongodb-memory-server'
+import { sqliteAdapter } from '@payloadcms/db-sqlite'
+import { MongoMemoryReplSet, MongoMemoryServer } from 'mongodb-memory-server'
 import { buildConfig, createLocalReq, getPayload, handleEndpoints, type Config, type Payload } from 'payload'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { answersFor, flowSteps, wizardsPlugin, type Answer } from '../src/index.js'
 
@@ -19,7 +20,11 @@ type Doc = Record<string, any> // eslint-disable-line @typescript-eslint/no-expl
 
 let scoped: Payload
 let open: Payload
-let mongo: MongoMemoryReplSet
+let replset: MongoMemoryReplSet
+let standalone: MongoMemoryServer
+let scopedKey = ''
+let dbOf: (name: string) => ReturnType<typeof mongooseAdapter> | ReturnType<typeof sqliteAdapter>
+const sqliteDir = mkdtempSync(join(tmpdir(), 'wizards-scope-sqlite-'))
 const uploads = mkdtempSync(join(tmpdir(), 'wizards-scope-media-'))
 const flows = { 'kit-activation': { slots: [{ steps: 'safety' }] }, 'check-in': { slots: [{ steps: 'arrival' }] } }
 
@@ -36,10 +41,10 @@ const config = (db: string, scope: boolean, indexWith?: string[]) =>
     secret: 'test-secret-not-for-production',
     telemetry: false,
     typescript: { autoGenerate: false },
-    db: mongooseAdapter({ url: mongo.getUri(db), ensureIndexes: true }),
+    db: dbOf(db),
     collections: [
       { slug: 'users', auth: true, fields: [{ name: 'role', type: 'text' }, { name: 'site', type: 'text' }] },
-      { slug: 'media', upload: { staticDir: uploads }, access: { read: () => true, create: () => true }, fields: [] },
+      { slug: 'media', upload: { staticDir: uploads }, access: { read: ({ req }) => (req.user ? { site: { equals: (req.user as { site?: string }).site } } : false), create: () => true }, fields: [{ name: 'site', type: 'text' }] },
     ],
     plugins: [
       wizardsPlugin({
@@ -64,7 +69,7 @@ const yesTo = async (flow: string, who: string): Promise<Answer[]> => {
   return slots.flatMap((s) => ('step' in s ? [{ key: s.step.key, hash: s.step.hash, value: 'yes' }] : []))
 }
 const rest = async (p: Payload, path: string, who: string | null) => {
-  const res = await handleEndpoints({ config: p.config, request: new Request(`http://localhost:3000/api${path}`, { headers: who ? { Authorization: `JWT ${tokens[who]}` } : {} }) })
+  const res = await handleEndpoints({ config: p.config, payloadInstanceCacheKey: scopedKey, request: new Request(`http://localhost:3000/api${path}`, { headers: who ? { Authorization: `JWT ${tokens[who]}` } : {} }) })
   return { status: res.status, body: (await res.json()) as Doc }
 }
 const gql = async (who: string, query: string) => {
@@ -75,9 +80,33 @@ const gql = async (who: string, query: string) => {
 }
 
 beforeAll(async () => {
-  mongo = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } })
-  scoped = await getPayload({ key: 'scoped', config: await config('scoped', true, ['site']) })
-  open = await getPayload({ key: 'open', config: await config('open', false) })
+  replset = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } })
+  standalone = await MongoMemoryServer.create()
+}, 120_000)
+
+afterAll(async () => {
+  await replset?.stop()
+  await standalone?.stop()
+  rmSync(uploads, { recursive: true, force: true })
+  rmSync(sqliteDir, { recursive: true, force: true })
+})
+
+// The same checks on every database the plugin runs on. SQLite is run with its default (no transactions) and with them on.
+let count = 0
+const variants: [string, (name: string) => ReturnType<typeof mongooseAdapter> | ReturnType<typeof sqliteAdapter>][] = [
+  ['mongo replica set', (name) => mongooseAdapter({ url: replset.getUri(name), ensureIndexes: true })],
+  ['mongo standalone', (name) => mongooseAdapter({ url: standalone.getUri(name), ensureIndexes: true })],
+  ['sqlite, default settings', (name) => sqliteAdapter({ client: { url: `file:${join(sqliteDir, `${name}.db`)}` } })],
+  ['sqlite, transactions on', (name) => sqliteAdapter({ client: { url: `file:${join(sqliteDir, `${name}.db`)}` }, transactionOptions: {} })],
+]
+
+describe.each(variants)('%s', (_label, makeDb) => {
+const n = `-${++count}`
+beforeAll(async () => {
+  dbOf = makeDb
+  scopedKey = `scoped${n}`
+  scoped = await getPayload({ key: `scoped${n}`, config: await config(`scoped${n}`, true, ['site']) })
+  open = await getPayload({ key: `open${n}`, config: await config(`open${n}`, false) })
   for (const [name, role, site] of [['editorA', 'editor', 'a'], ['editorB', 'editor', 'b'], ['memberA', 'member', 'a']] as const) {
     const u = (await scoped.create({ collection: 'users' as never, data: { email: `${name}@example.com`, password: 'made-up-pass-1', role, site } as never, overrideAccess: true })) as Doc
     users[name] = { ...u, collection: 'users' }
@@ -95,8 +124,6 @@ beforeAll(async () => {
 afterAll(async () => {
   await scoped?.destroy()
   await open?.destroy()
-  await mongo?.stop()
-  rmSync(uploads, { recursive: true, force: true })
 })
 
 describe('unset scope keeps 0.1.0 behavior', () => {
@@ -166,7 +193,7 @@ describe('scope fails closed', () => {
     expect(await answersFor(scoped, { flow: 'kit-activation', answers: await yesTo('kit-activation', 'editorA') })).toMatchObject({ ok: false, problem: 'noScope' })
   })
 
-  for (const [name, bad] of [['throws', () => { throw new Error('no site') }], ['returns {}', () => ({})], ['returns null', () => null], ['returns an array', () => [{ site: { equals: 'a' } }]]] as const) {
+  for (const [name, bad] of [['throws', () => { throw new Error('no site') }], ['returns {}', () => ({})], ['returns null', () => null], ['returns an array', () => [{ site: { equals: 'a' } }]], ['returns an empty or', () => ({ or: [] })], ['returns an empty and', () => ({ and: [] })], ['returns an empty operator object', () => ({ site: {} })], ['returns an empty or inside an and', () => ({ and: [{ or: [] }] })], ['returns an undefined value', () => ({ site: { equals: undefined } })], ['returns an empty in list', () => ({ site: { in: [] } })], ['returns an unknown operator', () => ({ site: { near: 'a' } })], ['returns a field with no operator object', () => ({ site: 'a' })], ['returns a class instance', () => new (class { site = { equals: 'a' } })()]] as const) {
     it(`refuses every path when the hook ${name}`, async () => {
       const good = hook
       const answers = await yesTo('kit-activation', 'editorA')
@@ -236,7 +263,7 @@ describe('writes stay inside the caller’s site', () => {
 
   it('applies over REST too: a PATCH from the wrong site is refused', async () => {
     const [b] = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'b-only' } } as never, overrideAccess: true })).docs as Doc[]
-    const res = await handleEndpoints({ config: scoped.config, request: new Request(`http://localhost:3000/api/guided-steps/${b!.id}`, { method: 'PATCH', headers: { Authorization: `JWT ${tokens.editorA}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ question: 'rest takeover' }) }) })
+    const res = await handleEndpoints({ config: scoped.config, payloadInstanceCacheKey: scopedKey, request: new Request(`http://localhost:3000/api/guided-steps/${b!.id}`, { method: 'PATCH', headers: { Authorization: `JWT ${tokens.editorA}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ question: 'rest takeover' }) }) })
     expect(res.status).toBeGreaterThanOrEqual(400)
     expect(((await scoped.findByID({ collection: 'guided-steps' as never, id: b!.id, overrideAccess: true })) as Doc).question).toBe('Only on site B?')
   })
@@ -252,7 +279,7 @@ describe('checks run per site', () => {
 
   it('keeps the start-up checks config-wide: scope never hides a flow registered twice', async () => {
     const twice = (c: Config) => ({ ...c, custom: { ...c.custom, wizardFlows: [{ owner: 'other', flows: { f: { slots: [{ code: 'x' }] } } }] } })
-    await expect(getPayload({ key: 'scope-dup', config: await buildConfig({ secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: mongooseAdapter({ url: mongo.getUri('scope-dup') }), collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows: { f: { slots: [{ code: 'x' }] } }, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }) } }), twice] }) } as never)).rejects.toThrow(/registered by both/)
+    await expect(getPayload({ key: `scope-dup${n}`, config: await buildConfig({ secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: mongooseAdapter({ url: replset.getUri('scope-dup') }), collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows: { f: { slots: [{ code: 'x' }] } }, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }) } }), twice] }) } as never)).rejects.toThrow(/registered by both/)
   })
 })
 
@@ -261,4 +288,95 @@ describe('indexWith', () => {
     await expect(make(scoped, 'editorA', { site: 'a', key: 'wash', question: 'again' })).rejects.toThrow()
     expect((await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: 'wash' } } as never, overrideAccess: true })).totalDocs).toBe(2)
   })
+})
+
+
+describe('refusals before the write, as 403', () => {
+  it('refuses a seed with no user before anything is saved, on every database', async () => {
+    await expect(scoped.create({ collection: 'guided-steps' as never, data: { flow: 'kit-activation', group: 'safety', kind: 'gate', stopMessage: 's', site: 'b', key: 'seeded', question: 'q' } as never, overrideAccess: true })).rejects.toThrow()
+    expect((await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: 'seeded' } } as never, overrideAccess: true })).totalDocs).toBe(0)
+  })
+
+  it('answers 403, not 400 or 500, for a create into another site and for a move out, whether or not the key exists there', async () => {
+    for (const data of [{ site: 'b', key: 'wash', question: 'q' }, { site: 'b', key: 'free-key', question: 'q' }])
+      await expect(make(scoped, 'editorA', data)).rejects.toMatchObject({ status: 403 })
+    const [doc] = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'a-only' } } as never, overrideAccess: true })).docs as Doc[]
+    await expect(scoped.update({ collection: 'guided-steps' as never, id: doc!.id, data: { site: 'b', key: 'wash' } as never, ...asUser('editorA') })).rejects.toMatchObject({ status: 403 })
+    const post = await handleEndpoints({ config: scoped.config, payloadInstanceCacheKey: scopedKey, request: new Request('http://localhost:3000/api/guided-steps', { method: 'POST', headers: { Authorization: `JWT ${tokens.editorA}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ flow: 'kit-activation', group: 'safety', kind: 'gate', stopMessage: 's', site: 'b', key: 'wash', question: 'q' }) }) })
+    expect(post.status).toBe(403)
+  })
+
+  it('refuses an anonymous delete by where and leaves the other site’s steps', async () => {
+    const before = (await scoped.count({ collection: 'guided-steps' as never, overrideAccess: true })).totalDocs
+    await scoped.delete({ collection: 'guided-steps' as never, where: { flow: { equals: 'kit-activation' } } as never, overrideAccess: true }).catch(() => null)
+    expect((await scoped.count({ collection: 'guided-steps' as never, overrideAccess: true })).totalDocs).toBe(before)
+  })
+
+  it('refuses an anonymous or other-site delete by id in beforeDelete even with overrideAccess', async () => {
+    const [b] = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'b-only' } } as never, overrideAccess: true })).docs as Doc[]
+    await expect(scoped.delete({ collection: 'guided-steps' as never, id: b!.id, overrideAccess: true, user: users.editorA as never })).rejects.toMatchObject({ status: 403 })
+    expect((await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: 'b-only' } } as never, overrideAccess: true })).totalDocs).toBe(1)
+  })
+})
+
+describe('the access functions themselves', () => {
+  const access = () => (scoped.collections['guided-steps' as never] as Doc).config.access as Record<string, (a: Doc) => Promise<unknown>>
+  const call = async (op: string, who: string) => access()[op]!({ req: await reqOf(scoped, who), id: 'x' })
+
+  it('update, delete and read hand back the site filter for an editor, and refuse a member to write', async () => {
+    expect(await call('update', 'editorA')).toEqual({ site: { equals: 'a' } })
+    expect(await call('delete', 'editorB')).toEqual({ site: { equals: 'b' } })
+    expect(await call('read', 'editorA')).toEqual({ site: { equals: 'a' } })
+    expect(await call('read', 'memberA')).toEqual({ and: [{ active: { equals: true } }, { site: { equals: 'a' } }] })
+    expect(await call('update', 'memberA')).toBe(false)
+    expect(await call('create', 'memberA')).toBe(false)
+    expect(await call('create', 'editorA')).toBe(true)
+  })
+
+  it('refuse everything when the hook is bad, including a class instance', async () => {
+    const good = hook
+    try {
+      for (const bad of [() => { throw new Error('x') }, () => ({}), () => null, () => new (class { site = { equals: 'a' } })()]) {
+        hook = bad as never
+        for (const op of ['read', 'create', 'update', 'delete']) expect(await call(op, 'editorA'), op).toBe(false)
+      }
+    } finally {
+      hook = good
+    }
+  })
+})
+
+describe('media is looked up as the caller', () => {
+  const file = (site: string, name: string, mimetype: string) => scoped.create({ collection: 'media' as never, data: { site } as never, file: { data: Buffer.from('made-up'), mimetype, name, size: 7 }, overrideAccess: true }) as Promise<Doc>
+
+  it('refuses another site’s video and captions, and shows a site its own', async () => {
+    const [aVideo, aVtt, bVideo, bVtt] = [await file('a', 'a.mp4', 'video/mp4'), await file('a', 'a.vtt', 'text/vtt'), await file('b', 'b.mp4', 'video/mp4'), await file('b', 'b.vtt', 'text/vtt')]
+    await expect(make(scoped, 'editorA', { site: 'a', key: 'takes-b', question: 'q', video: bVideo.id, captions: bVtt.id })).rejects.toThrow(/video file/)
+    expect((await scoped.count({ collection: 'guided-steps' as never, where: { key: { equals: 'takes-b' } } as never, overrideAccess: true })).totalDocs).toBe(0)
+    await make(scoped, 'editorA', { site: 'a', key: 'has-video', question: 'With a video', video: aVideo.id, captions: aVtt.id })
+    const steps = (await flowSteps(scoped, { flow: 'kit-activation', req: await reqOf(scoped, 'editorA') })).slots.flatMap((s) => ('step' in s ? [s.step] : []))
+    expect(steps.find((x) => x.key === 'has-video')!.video?.url).toMatch(/\/a(-\d+)?\.mp4$/)
+    // If the file ends up outside the site, the step shows no video rather than the other site's file.
+    const [doc] = (await scoped.find({ collection: 'guided-steps' as never, where: { key: { equals: 'has-video' } } as never, overrideAccess: true })).docs as Doc[]
+    await scoped.db.updateOne({ collection: 'guided-steps' as never, id: doc!.id, data: { video: bVideo.id, captions: bVtt.id } as never, req: await reqOf(scoped, 'editorA') })
+    const after = (await flowSteps(scoped, { flow: 'kit-activation', req: await reqOf(scoped, 'editorA') })).slots.flatMap((s) => ('step' in s ? [s.step] : []))
+    expect(after.find((x) => x.key === 'has-video')!.video).toBeNull()
+  })
+})
+
+describe('start-up', () => {
+  it('warns when scope is set without indexWith, and not with it', async () => {
+    const run = async (indexWith?: string[]) => {
+      const warn = vi.fn()
+      const spy = (c: Config): Config => ({ ...c, onInit: async (p) => { p.logger.warn = warn as never; await c.onInit?.(p) } })
+      const key = `warn${n}${indexWith ? 'i' : 'n'}`
+      const p = await getPayload({ key, config: await buildConfig({ secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: makeDb(key), collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }), ...(indexWith ? { indexWith } : {}) } }), siteField, spy] }) } as never)
+      await p.destroy()
+      return warn
+    }
+    expect((await run()).mock.calls.join(' ')).toMatch(/indexWith/)
+    expect((await run(['site'])).mock.calls).toHaveLength(0)
+  })
+})
+
 })

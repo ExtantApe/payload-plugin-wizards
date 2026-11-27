@@ -32,14 +32,21 @@ Mutation check on the server: 9 of 9 guards caught.
 
 ## 2026-11-26: 0.1.1 scope option
 
-| Promise | Test (`test/scope.test.ts`) |
+All of `test/scope.test.ts` runs four times: MongoDB replica set, MongoDB standalone, SQLite with default settings (no transactions) and SQLite with transactions on.
+
+| Promise | Test |
 | --- | --- |
 | Scope unset is 0.1.0: every step, no `req`, flow + key unique | `unset scope keeps 0.1.0 behavior` |
 | Reads limited to the caller's site: Local, REST list and count, GraphQL, Local count, `flowSteps`, `answersFor` | `reads stay inside the caller's site` |
 | No `req` with a scope refuses `flowSteps` and `answersFor` | `scope fails closed > refuses flowSteps and answersFor…` |
-| A hook that throws, returns `{}`, `null` or an array refuses every read, write, `flowSteps` and `answersFor` | four tests under `scope fails closed` |
-| Create, update, bulk update, delete and REST PATCH limited to the site; a create into or an update moving to another site is refused and leaves nothing changed | `writes stay inside the caller's site` |
+| A hook that throws, or returns `{}`, `null`, an array, an empty or / and, an empty operator object, an empty or nested in an and, an undefined value, an empty `in`, an unknown operator, a bare value or a class instance, refuses every read, write, `flowSteps` and `answersFor` | one test per shape under `scope fails closed` |
+| Create, update, bulk update, delete and REST PATCH limited to the site; a write into or moving to another site is refused before the save and leaves nothing | `writes stay inside the caller's site`, `refusals before the write, as 403` |
+| A refused write is a 403 whether or not the key exists on the other site; an overrideAccess seed with no user and an overrideAccess delete are refused | `refusals before the write, as 403` |
+| Access functions return the site filter or false (kills three mutants: update without the scope, create ignoring it, no plain-object check) | `the access functions themselves` |
+| A video or captions from another site is refused on save and never shown | `media is looked up as the caller` |
 | The empty-group refusal runs per site; the start-up check stays config-wide | `checks run per site` |
-| `indexWith` lets two sites share a key and still refuses a repeat on one site | `indexWith`, plus the unscoped contrast in the first block |
+| `indexWith` lets two sites share a key and still refuses a repeat on one site; the start-up warning | `indexWith`, `start-up` |
 
-Gaps skipped: a Postgres or SQLite adapter (the check is a plain count in the write's transaction, but only MongoDB was run), the media lookup (reads one file type, unscoped by decision), and versions (the collection has none). Failing-first: with the source change stashed, the new file's setup fails and none of its tests pass.
+Failing-first, as the review measured it: on main the new file's setup fails at the unique flow + key index, because two sites share a key. With that index dropped, 18 of the first 21 tests failed for the right reason and the 3 controls passed. The first build had a rollback-based write check that these tests passed on Mongo with transactions and missed on the other databases; running all four now covers that.
+
+Gaps skipped: Postgres (the checks use no database-specific code, but only Mongo and SQLite were run) and versions (the collection has none).

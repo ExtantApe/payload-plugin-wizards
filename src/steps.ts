@@ -1,21 +1,80 @@
 import { createHash } from 'node:crypto'
 
-import type { CollectionAfterChangeHook, CollectionBeforeChangeHook, CollectionConfig, CollectionSlug, Payload, PayloadRequest, Where } from 'payload'
+import { APIError } from 'payload'
+import type { CollectionBeforeChangeHook, CollectionBeforeDeleteHook, CollectionConfig, CollectionSlug, Payload, PayloadRequest, Where } from 'payload'
 
 import type { Answer, Flow, FlowRegistration, Req, Resolved, Step, WizardRecord } from './types.js'
 
-/** The scope could not be worked out, so the call is refused. */
-export class ScopeError extends Error {}
+const configOf = (payload: Payload): Resolved => {
+  const o = payload.config.custom?.wizards as Resolved | undefined
+  if (!o) throw new Error('Wizards: the plugin is not configured on this site.')
+  return o
+}
 
-const isPlain = (v: unknown): v is Where => {
+/** The scope could not be worked out, or a write or read falls outside it. Carries status 403. */
+export class ScopeError extends APIError {
+  constructor(message: string) {
+    super(message, 403, undefined, true)
+  }
+}
+
+const isObject = (v: unknown): v is Record<string, unknown> => {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false
   const proto = Object.getPrototypeOf(v)
-  return (proto === Object.prototype || proto === null) && Object.keys(v).length > 0
+  return proto === Object.prototype || proto === null
 }
+
+const COMPARE = ['greater_than', 'greater_than_equal', 'less_than', 'less_than_equal']
+const OPERATORS = ['equals', 'not_equals', 'in', 'not_in', 'exists', 'contains', 'like', ...COMPARE]
+
+/**
+ * A scope is safe to apply only if it can't match everything by accident. At every depth: `and` and `or` are
+ * non-empty arrays of scopes, a field maps to a non-empty object of known operators, no value is undefined, and
+ * `in` and `not_in` lists aren't empty. Plain objects only. A deliberate match-all is the host's own choice.
+ */
+const validScope = (w: unknown): w is Where => {
+  if (!isObject(w)) return false
+  const keys = Object.keys(w)
+  if (!keys.length) return false
+  return keys.every((k) => {
+    const v = w[k]
+    if (k === 'and' || k === 'or') return Array.isArray(v) && v.length > 0 && v.every(validScope)
+    if (!isObject(v)) return false
+    const ops = Object.keys(v)
+    return ops.length > 0 && ops.every((op) => OPERATORS.includes(op) && v[op] !== undefined && !((op === 'in' || op === 'not_in') && !(Array.isArray(v[op]) && (v[op] as unknown[]).length > 0)))
+  })
+}
+
+const norm = (v: unknown): unknown => (v && typeof v === 'object' ? (v instanceof Date ? v.toISOString() : 'id' in v ? String((v as { id: unknown }).id) : v) : v == null ? v : String(v))
+const pathValue = (doc: Doc, path: string): unknown => path.split('.').reduce<unknown>((acc, k) => (acc && typeof acc === 'object' ? (acc as Doc)[k] : undefined), doc)
+
+/** Whether a document (as it would be saved) matches a validated scope, worked out in memory before anything is written. */
+const matches = (doc: Doc, w: Where): boolean =>
+  Object.entries(w).every(([k, v]) => {
+    if (k === 'and') return (v as Where[]).every((x) => matches(doc, x))
+    if (k === 'or') return (v as Where[]).some((x) => matches(doc, x))
+    const val = norm(pathValue(doc, k))
+    return Object.entries(v as Record<string, unknown>).every(([op, arg]) => {
+      switch (op) {
+        case 'equals': return val != null && val === norm(arg)
+        case 'not_equals': return val !== norm(arg)
+        case 'in': return val != null && (arg as unknown[]).map(norm).includes(val)
+        case 'not_in': return !(arg as unknown[]).map(norm).includes(val)
+        case 'exists': return (val != null) === Boolean(arg)
+        case 'contains':
+        case 'like': return typeof val === 'string' && val.toLowerCase().includes(String(arg).toLowerCase())
+        default: {
+          if (val == null) return false
+          const [x, y] = typeof val === 'string' && Number.isNaN(Number(val)) ? [val, String(norm(arg))] : [Number(val), Number(norm(arg))]
+          return op === 'greater_than' ? x > y : op === 'greater_than_equal' ? x >= y : op === 'less_than' ? x < y : x <= y
+        }
+      }
+    })
+  })
 
 /**
  * The caller's scope: `null` when the host set none (0.1.0 behavior), otherwise its `where`. Fails closed: no
- * request, a hook that throws, or anything but a non-empty plain object raises ScopeError.
+ * request, a hook that throws, or anything that isn't a valid scope raises ScopeError.
  */
 const scopeOf = async (o: Resolved, req: Req | undefined): Promise<Where | null> => {
   if (!o.scope) return null
@@ -26,7 +85,7 @@ const scopeOf = async (o: Resolved, req: Req | undefined): Promise<Where | null>
   } catch {
     throw new ScopeError('Wizards: the scope hook threw, so the call is refused.')
   }
-  if (!isPlain(w)) throw new ScopeError('Wizards: the scope hook must return a non-empty object, so the call is refused.')
+  if (!validScope(w)) throw new ScopeError('Wizards: the scope hook must return a non-empty filter with no empty and/or lists or empty operator objects, so the call is refused.')
   return w
 }
 
@@ -43,22 +102,21 @@ const withScope = async (o: Resolved, req: Req, result: boolean | Where): Promis
   return result === true ? scope : { and: [result, scope] }
 }
 
-/** Refuses a write that leaves the step outside the caller's scope. Runs in the write's own transaction, so a throw undoes it. */
-const afterChange =
-  (o: Resolved): CollectionAfterChangeHook =>
-  async ({ doc, req }) => {
-    if (!o.scope) return doc
-    const scope = await scopeOf(o, req)
-    const { totalDocs } = await req.payload.count({ collection: o.slug as CollectionSlug, where: { and: [{ id: { equals: doc.id } }, scope!] }, overrideAccess: true, req })
-    if (!totalDocs) throw new ScopeError('This step would be outside your scope.')
-    return doc
-  }
-
-const configOf = (payload: Payload): Resolved => {
-  const o = payload.config.custom?.wizards as Resolved | undefined
-  if (!o) throw new Error('Wizards: the plugin is not configured on this site.')
-  return o
+/** Refuses, before anything is saved, a step that would sit outside the caller's scope. */
+const checkWrite = async (o: Resolved, next: Doc, req: Req) => {
+  const scope = await scopeOf(o, req)
+  if (scope && !matches(next, scope)) throw new ScopeError('This step would be outside your scope.')
 }
+
+/** Refuses, before the delete, a step outside the caller's scope. */
+const beforeDelete =
+  (o: Resolved): CollectionBeforeDeleteHook =>
+  async ({ id, req }) => {
+    const scope = await scopeOf(o, req)
+    if (!scope) return
+    const { totalDocs } = await req.payload.count({ collection: o.slug as CollectionSlug, where: { and: [{ id: { equals: id } }, scope] }, overrideAccess: true, req })
+    if (!totalDocs) throw new ScopeError('This step is outside your scope.')
+  }
 
 /** A media file as the hash sees it: its id and when it last changed, so a swapped or replaced file counts as new. */
 const fileOf = (v: unknown) => (v && typeof v === 'object' ? [String((v as { id?: unknown }).id ?? ''), String((v as { updatedAt?: unknown }).updatedAt ?? '')] : v ? [String(v), ''] : null)
@@ -80,6 +138,7 @@ const beforeChange =
   (o: Resolved): CollectionBeforeChangeHook =>
   async ({ data, originalDoc, req }) => {
     const next = { ...originalDoc, ...data }
+    await checkWrite(o, next, req)
     if (next.video && !next.captions) throw new Error('A step with a video needs its captions (a WebVTT file).')
     if (next.kind === 'choice' && !(Array.isArray(next.options) && next.options.length >= 2)) throw new Error('A choice step needs at least two options.')
     if (next.kind === 'choice') {
@@ -89,7 +148,7 @@ const beforeChange =
     }
     if (next.kind !== 'info' && !String(next.stopMessage ?? '').trim()) throw new Error('A gate or choice step needs a stop message: what to do when the answer is No.')
     if (o.media && (next.video || next.captions)) {
-      const mime = async (v: unknown) => String(((await req.payload.findByID({ collection: o.media as CollectionSlug, id: idOf(v) as string, depth: 0, overrideAccess: true, req }).catch(() => null)) as { mimeType?: unknown } | null)?.mimeType ?? '')
+      const mime = async (v: unknown) => String(((await req.payload.findByID({ collection: o.media as CollectionSlug, id: idOf(v) as string, depth: 0, overrideAccess: !o.scope, req }).catch(() => null)) as { mimeType?: unknown } | null)?.mimeType ?? '')
       if (next.video && !(await mime(next.video)).startsWith('video/')) throw new Error('The video needs to be a video file.')
       if (next.captions && !/^text\/(vtt|plain)$/.test(await mime(next.captions))) throw new Error('The captions need to be a WebVTT (.vtt) file.')
     }
@@ -106,7 +165,7 @@ export const stepsCollection = (o: Resolved): CollectionConfig => ({
     update: async (args) => withScope(o, args.req, (await o.edit(args)) === true),
     delete: async (args) => withScope(o, args.req, (await o.edit(args)) === true),
   },
-  hooks: { beforeChange: [beforeChange(o)], afterChange: [afterChange(o)] },
+  hooks: { beforeChange: [beforeChange(o)], beforeDelete: [beforeDelete(o)] },
   indexes: [{ fields: ['flow', 'key', ...(o.scope?.indexWith ?? [])], unique: true }],
   fields: [
     { name: 'flow', type: 'text', required: true, index: true },
@@ -172,7 +231,17 @@ export async function flowSteps(payload: Payload, args: { flow: string; locale?:
   const flows = flowsOf(payload)
   const flow = Object.hasOwn(flows, args.flow) ? flows[args.flow]! : null
   if (!flow) throw new Error(`Wizards: no flow "${args.flow}".`)
-  const docs = (await payload.find({ collection: o.slug as CollectionSlug, where: { and: [{ flow: { equals: args.flow } }, { active: { equals: true } }, ...(scope ? [scope] : [])] }, sort: ['order', 'key'], pagination: false, depth: 1, overrideAccess: true, ...(args.locale ? { locale: args.locale as never } : {}) })).docs as Doc[]
+  const docs = (await payload.find({ collection: o.slug as CollectionSlug, where: { and: [{ flow: { equals: args.flow } }, { active: { equals: true } }, ...(scope ? [scope] : [])] }, sort: ['order', 'key'], pagination: false, depth: scope ? 0 : 1, overrideAccess: true, ...(args.locale ? { locale: args.locale as never } : {}) })).docs as Doc[]
+  // With a scope, files are fetched as the caller, so another site's video and captions never reach this site's page.
+  if (scope) {
+    const asCaller = async (v: unknown) => (v ? ((await payload.findByID({ collection: o.media as CollectionSlug, id: idOf(v) as string, depth: 0, overrideAccess: false, req: args.req }).catch(() => null)) as Doc | null) : null)
+    for (const d of docs) {
+      if (o.media) {
+        d.video = await asCaller(d.video)
+        d.captions = await asCaller(d.captions)
+      }
+    }
+  }
   const out: ({ code: string } | { step: Step })[] = []
   const empty: string[] = []
   for (const slot of flow.slots) {

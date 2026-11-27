@@ -42,18 +42,22 @@ wizardsPlugin({
   flows,
   access: { edit },
   scope: {
-    where: ({ req }) => ({ site: { equals: req.user?.site } }),
+    where: ({ req }) => {
+      if (!req.user?.site) throw new Error('No site') // refuses plainly
+      return { site: { equals: req.user.site } }
+    },
     indexWith: ['site'],
   },
 })
 ```
 
-- **`where`** runs on every call with the request. It has to return a non-empty plain object. If it throws, or returns `{}`, `null` or an array, the call is refused. A host that wants every site leaves `scope` unset.
+- **`where`** runs on every call with the request. If it throws, the call is refused. It also has to return a filter that can't match everything by accident, and the plugin refuses anything else at every depth: a value that isn't a plain object, an empty `{}`, an empty `and` or `or` list, an empty operator object, an empty `in` or `not_in` list, an undefined value, or an operator outside `equals`, `not_equals`, `in`, `not_in`, `exists`, `contains`, `like`, `greater_than`, `greater_than_equal`, `less_than` and `less_than_equal`. Build `or` lists so that a user with no sites throws instead of producing `{ or: [] }`. A filter that matches everything on purpose, such as `{ id: { exists: true } }`, is your call. A host that wants every site leaves `scope` unset.
 - **Reads:** the scope is ANDed with what the access rules already allow, so the REST API, GraphQL, count and the Local API with `overrideAccess: false` only see the caller's steps. `flowSteps` and `answersFor` take `req` and apply the scope themselves. With a scope set and no `req` they refuse (`answersFor` answers `noScope`) and never fall back to all sites.
-- **Writes:** update and delete are limited to the caller's steps. A create or update that would leave the step outside the scope, including one that moves it to another site, is refused and undone in the same transaction. This runs for `overrideAccess: true` writes too, so seeding code has to pass a `req` the hook accepts.
-- **`indexWith`** adds your field names to the unique index on flow + key, so two sites can use the same key. You add the field yourself, in a plugin or config that runs after Wizards (`{ name: 'site', type: 'text', required: true, index: true }`, for example). Wizards doesn't create it.
+- **Writes:** update and delete access are limited to the caller's steps. A create or update is checked before it is saved, against the step as it would be stored (your changes merged over the stored step), so one that would leave the scope, including a move to another site, is refused with a 403 and nothing is written. That works the same with or without database transactions. The check is done in memory, using the operators listed above. A delete is checked in `beforeDelete`. These checks run for `overrideAccess: true` calls too, so seeding code has to pass a `req` the hook accepts.
+- **`indexWith`** adds your field names to the unique index on flow + key. Sites that share step keys need it, because without it the index is flow + key alone, so a second site can't reuse a key. You add the field yourself, in a plugin or config that runs after Wizards (`{ name: 'site', type: 'text', required: true, index: true }`, for example); naming a field that doesn't exist stops the site at start-up. If `scope` is set without `indexWith`, a warning is logged at start-up.
+- **Videos and captions:** the file-type check when a step is saved, and the files `flowSteps` returns, are looked up as the caller (`overrideAccess: false`), so a site can't attach or show another site's files. Give your media collection its own site-based read access. A file the caller can't read shows as no video.
 - **Per-site checks:** the group-with-no-active-step refusal runs inside the caller's scope. A site that never seeded its safety group is refused even when another site has one. The start-up checks (a flow registered twice, a group used twice) stay across the whole config.
-- **Limits:** `where` filters the steps collection only. The media lookup that checks a video's file type still reads the upload collection without a scope. The steps collection has no versions, so there is nothing to scope there.
+- **Limits:** the steps collection has no versions, so there is nothing to scope there. Tested on MongoDB (replica set and standalone) and SQLite (with and without transactions).
 
 ## On its own, and with others
 
