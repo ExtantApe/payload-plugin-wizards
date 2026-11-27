@@ -167,7 +167,11 @@ export const guardDb = (o: Resolved, db: Config['db'] | undefined): Config['db']
             checkWrite((a.data ?? {}) as Doc, scope)
             return original.call(this, a)
           }
-          if (name === 'updateOne') checkWrite((a.data ?? {}) as Doc, scope)
+          if (name === 'updateOne') {
+            // An upsert inserts when nothing matches, so the stored-step check would have nothing to read. Refused like `upsert` itself.
+            if (a.upsert || (a.options as Doc | undefined)?.upsert) throw new ScopeError('Wizards: an upsert on the steps is refused while a scope is set.')
+            checkWrite((a.data ?? {}) as Doc, scope)
+          }
           const target = targetOf(name, a)
           await checkStored(adapter, o, a, target, scope)
           const { id: _id, ...rest } = a

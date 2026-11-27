@@ -10,6 +10,8 @@ Second review round: the stored-step check no longer counts by `id` (the adapter
 
 Tested: 427 tests in all, on the same four databases, with new tests for each of those, including a start-up refusal for each of `find`, `updateMany`, `upsert`, `updateOne`, `deleteOne` and `deleteMany` wrapped by a later plugin. Not tested: concurrent writes against a real multi-site host, Postgres.
 
+Third review round: `updateOne` on the adapter with `upsert` set (top level or in `options`) is refused while a scope is set, the same as `upsert` itself. Before, a `where` that matched nothing inserted a new step. The data check still kept it inside the caller's site, but the README promised upserts were refused. Tested: a new test on each of the four databases, which checks that both forms return 403 and insert nothing. Not tested: Postgres.
+
 ## 0.1.0 (unreleased)
 
 First version, from design 0001: guided steps edited in the admin with a content hash, flows registered by code (and by other plugins), `flowSteps`, the `<Wizard>` component (one question per screen, gates, choices, captioned video, code steps, in-memory state), and `answersFor`, which checks every answer on the server before the owner acts.

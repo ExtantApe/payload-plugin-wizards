@@ -329,6 +329,14 @@ describe('only equals and in, with non-empty scalar values, are a scope', () => 
     await expect((scoped.db as Doc).updateMany({ collection: 'guided-steps', data: { site: 'a' }, where: { flow: { equals: 'kit-activation' } }, req })).rejects.toMatchObject({ status: 403 })
     await expect((scoped.db as Doc).upsert({ collection: 'guided-steps', data: { site: 'a' }, where: { key: { equals: 'a-only' } }, req })).rejects.toMatchObject({ status: 403 })
   })
+
+  it('refuses updateOne with upsert set, so a no-match where inserts nothing', async () => {
+    const req = await reqOf(scoped, 'editorA')
+    const where = { key: { equals: 'upsert-probe' } }
+    await expect((scoped.db as Doc).updateOne({ collection: 'guided-steps', data: { site: 'a', key: 'upsert-probe' }, where, options: { upsert: true }, req })).rejects.toMatchObject({ status: 403 })
+    await expect((scoped.db as Doc).updateOne({ collection: 'guided-steps', data: { site: 'a', key: 'upsert-probe' }, where, upsert: true, req })).rejects.toMatchObject({ status: 403 })
+    expect((await scoped.count({ collection: 'guided-steps' as never, where: where as never, overrideAccess: true })).totalDocs).toBe(0)
+  })
 })
 
 describe('the scope is checked on the step as it will be stored, after every host hook', () => {
