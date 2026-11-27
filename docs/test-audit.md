@@ -16,6 +16,9 @@ Kept by this repo's maintainers: after each feature or fix, and at least every 1
 | Drafts: no question refused at save and read; an untranslated published step refused | `… > refuses a draft with no question…` |
 | `<Wizard>` shows an alert and no answer buttons for each blank case, and never finishes; Back still works | client `refuses a step with a blank question or stop message` |
 
+| Invisible-only text (15 cases, NUL and a lone combining mark among them) refused at save and read in each field; emoji, non-Latin and joined text pass | `… > counts only text…`, `… > refuses to save…invisible…`, `… > refuses on the view…invisible…`, `… > saves, shows and passes emoji…`, client cases |
+| An empty locale records the default language | `… > records the default language…` |
+
 Skipped: the unknown-kind refusal in `answersFor` (Payload's required select stops it from being stored, so no test can reach it through the API); the new server tests on MongoDB (the check reads the document Payload returns, the same on every adapter); rich text (no such field).
 
 ## 2026-11-10: after the security read

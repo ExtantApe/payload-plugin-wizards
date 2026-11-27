@@ -253,7 +253,7 @@ const beforeChange =
     }
     if (!hasText(next.question)) throw new Error('A step needs a question with words in it, in each language it is saved in.')
     if (next.kind === 'choice' && !(next.options as { label?: unknown }[]).every((x) => hasText(x?.label))) throw new Error('Each option in a choice step needs a label with words in it.')
-    if (next.kind !== 'info' && !String(next.stopMessage ?? '').trim()) throw new Error('A gate or choice step needs a stop message: what to do when the answer is No.')
+    if (next.kind !== 'info' && !hasText(next.stopMessage)) throw new Error('A gate or choice step needs a stop message: what to do when the answer is No.')
     if (o.media && (next.video || next.captions)) {
       const mime = async (v: unknown) => String(((await req.payload.findByID({ collection: o.media as CollectionSlug, id: idOf(v) as string, depth: 0, overrideAccess: !o.scope, req }).catch(() => null)) as { mimeType?: unknown } | null)?.mimeType ?? '')
       if (next.video && !(await mime(next.video)).startsWith('video/')) throw new Error('The video needs to be a video file.')
@@ -426,6 +426,6 @@ export async function answersFor(payload: Payload, args: { flow: string; answers
     if (s.kind !== 'gate' && s.kind !== 'info' && s.kind !== 'choice') return { ok: false, problem: 'notYes', key: s.key }
   }
   const localization = payload.config.localization
-  const locale = args.locale ?? (localization ? localization.defaultLocale : null)
+  const locale = args.locale || (localization ? localization.defaultLocale : null)
   return { ok: true, record: { flow: args.flow, at: new Date().toISOString(), locale, answers: steps.map((s) => ({ key: s.key, hash: s.hash, value: byKey.get(s.key)![0]!.value, question: s.question })) } }
 }

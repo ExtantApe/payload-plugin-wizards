@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
+import { hasText } from '../src/blank.js'
 import { answersFor, contentHash, flowSteps, wizardsPlugin, type Answer } from '../src/index.js'
 
 // Made-up steps on throwaway SQLite files, in two languages. Each site has its own collection slug, so the schemas
@@ -169,5 +170,60 @@ describe('a step with a blank question or stop message is refused', () => {
     expect((await flowSteps(drafts, { flow: 'f', locale: 'en' })).blank).toEqual(['d'])
     expect(await answersFor(drafts, { flow: 'f', locale: 'en', answers: await yesTo(drafts, 'en') })).toMatchObject({ ok: false, problem: 'blankStep', key: 'd' })
     expect((await flowSteps(drafts, { flow: 'f', locale: 'es' })).blank.sort()).toEqual(['d', 'p'])
+  })
+
+  // Characters that draw nothing: zero-width space, joiner and word joiner, soft hyphen, Hangul fillers, braille blank,
+  // a direction mark, the Mongolian vowel separator, NUL, a variation selector and a lone combining mark.
+  const invisible: [string, string][] = [
+    ['U+200B', '​'], ['U+200D', '‍'], ['U+2060', '⁠'], ['U+00AD', '­'], ['U+3164', 'ㅤ'], ['U+2800', '⠀'],
+    ['U+200E', '‎'], ['U+180E', '᠎'], ['NUL', '\u0000'], ['U+FE0F', '️'], ['U+0301', '́'], ['U+115F', 'ᅟ'],
+    ['U+1160', 'ᅠ'], ['U+FFA0', 'ﾠ'], ['a mix with spaces', ' ​ㅤ ⠀́ '],
+  ]
+  const visible: [string, string][] = [['emoji only', '😀'], ['an emoji sequence with ZWJ', '👩‍🔬'], ['non-Latin text', '火を消しましたか'], ['text with ZWJ', 'क्‍ष'], ['a question mark only', '?']]
+
+  it('counts only text with a letter, number, punctuation or symbol left after removing invisible characters', () => {
+    for (const [label, t] of invisible) expect(hasText(t), label).toBe(false)
+    for (const [label, t] of visible) expect(hasText(t), label).toBe(true)
+  })
+
+  it('refuses to save a question, stop message or option label made only of invisible characters', async () => {
+    await clear(on)
+    for (const [label, t] of invisible) {
+      await expect(make(on, { key: 'q', question: t, stopMessage: 'Stop.' }), `question ${label}`).rejects.toThrow(/question/)
+      await expect(make(on, { key: 's', question: 'Q?', stopMessage: t }), `stop message ${label}`).rejects.toThrow(/stop message/)
+      await expect(make(on, { key: 'c', kind: 'choice', question: 'Q?', stopMessage: 'Stop.', options: [{ value: 'y', label: t }, { value: 'n', label: 'No', stops: true }] }), `label ${label}`).rejects.toThrow(/option/)
+    }
+    expect((await on.find({ collection: slugOf(on) as never, limit: 0, pagination: false })).docs).toEqual([])
+  })
+
+  it('refuses on the view and every answer invisible-only text that reached the database another way', async () => {
+    const choice = { kind: 'choice', question: 'Q?', stopMessage: 'Stop.', options: [{ value: 'y', label: 'Yes' }, { value: 'n', label: 'No', stops: true }] }
+    for (const [label, t] of invisible) {
+      for (const [field, blank] of [['question', { question: t }], ['stop message', { stopMessage: t }], ['option label', { options: [{ value: 'y', label: t }, { value: 'n', label: 'No', stops: true }] }]] as const) {
+        await clear(on)
+        const d = await make(on, { key: 'k', ...choice })
+        const good = await yesTo(on)
+        await plant(on, d.id, (x) => ({ ...x, ...blank }))
+        expect((await flowSteps(on, { flow: 'f' })).blank, `${field} ${label}`).toEqual(['k'])
+        expect(await answersFor(on, { flow: 'f', answers: good }), `${field} ${label}`).toMatchObject({ ok: false, problem: 'blankStep', key: 'k' })
+      }
+    }
+  })
+
+  it('saves, shows and passes emoji, non-Latin text and text with a joiner', async () => {
+    for (const [label, t] of visible) {
+      await clear(on)
+      await make(on, { key: 'k', kind: 'choice', question: t, stopMessage: t, options: [{ value: 'y', label: t }, { value: 'n', label: 'No', stops: true }] })
+      expect((await flowSteps(on, { flow: 'f' })).blank, label).toEqual([])
+      const r = await answersFor(on, { flow: 'f', answers: await yesTo(on) })
+      expect(r.ok && r.record.answers[0]!.question, label).toBe(t)
+    }
+  })
+
+  it('records the default language when the locale given is empty', async () => {
+    await clear(on)
+    await make(on, { key: 'a', question: 'Is the lid on?', stopMessage: 'Put the lid on first.' })
+    const r = await answersFor(on, { flow: 'f', locale: '', answers: await yesTo(on, '') })
+    expect(r.ok && r.record.locale).toBe('en')
   })
 })

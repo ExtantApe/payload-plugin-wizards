@@ -326,6 +326,9 @@ describe('<Wizard> refuses a step with a blank question or stop message', () => 
     ['a stop message of spaces on a choice', { ...choice, stopMessage: '   ' }],
     ['a choice option with no label', { ...choice, options: [choice.options[0]!, { value: 'down', label: ' ', stops: false }] }],
     ['an info step with no title', step({ key: 'i', kind: 'info', question: ' ' })],
+    ['a zero-width question', step({ key: 'q', question: '\u200b\u200d' })],
+    ['a Hangul filler stop message', step({ key: 's', stopMessage: '\u3164' })],
+    ['a braille blank option label', { ...choice, options: [choice.options[0]!, { value: 'down', label: '\u2800', stops: false }] }],
   ]
   for (const [label, blank] of blanks) {
     it(`shows an alert and no way to answer for ${label}, and never finishes`, () => {
@@ -344,4 +347,10 @@ describe('<Wizard> refuses a step with a blank question or stop message', () => 
     fireEvent.click(btn('Back'))
     expect(heading().textContent).toBe('Question i?')
   })
+})
+
+it('<Wizard> shows a step whose text is emoji, non-Latin or has a joiner', () => {
+  render(<Wizard slots={[{ step: step({ key: 'e', question: '👩\u200d🔬 火?', stopMessage: '😀' }) }]} renderCode={{}} onFinish={() => {}} />)
+  expect(heading().textContent).toBe('👩\u200d🔬 火?')
+  expect(btn('Yes')).toBeTruthy()
 })
