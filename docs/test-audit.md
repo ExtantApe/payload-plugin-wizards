@@ -21,6 +21,60 @@ Kept by this repo's maintainers: after each feature or fix, and at least every 1
 
 Skipped: the unknown-kind refusal in `answersFor` (Payload's required select stops it from being stored, so no test can reach it through the API); the new server tests on MongoDB (the check reads the document Payload returns, the same on every adapter); rich text (no such field).
 
+## 2026-11-27: sweep of every promise
+
+The promises in the README, `docs/decisions.md`, design 0001 and the code's own comments were listed and matched to tests. The suite went from 431 tests to 450: 15 more server tests, 3 more in the database check tests that need no site, and 1 more component test. Two older tests got more assertions (the content hash, and what the component stores or sends). Nothing in `src/` changed.
+
+### Covered before this sweep
+
+| Promise | Tests |
+| --- | --- |
+| Editors change steps; the public's list holds active steps only; a member can't create | `wizards.test.ts`: `steps > lets editors…` |
+| A gate needs a stop message, a video needs captions, choice values are unique, and files are the right type | `steps > refuses a gate…`, `what the security read found` |
+| Code slots and active steps in order; other plugins' flows; a duplicate flow or a repeated group stops start-up | `flows`, `what the security read found > refuses at start-up…` |
+| `answersFor` refuses a No, a stopping choice, a wrong info value, missing, extra, repeated, stale and unknown, and a group with no active step | `answers are checked on the server`, `what the security read found` |
+| Hashes per language; the record holds the language and each question as read | `what the security read found > works out the hash per language…` |
+| The scope: reads, writes, refusals, operators, stored values, hooks, plugin order, versions, media, `indexWith`, per-site checks | `scope.test.ts`, on four databases (see the 2026-11-26 entries) |
+| The component: one question per screen, focus, progress, Back, No, choices, info, captioned video, code steps, finishing once and retrying, buttons, no web storage or cookies | `client/Wizard.test.tsx` |
+
+### Gaps added
+
+| Promise | New test |
+| --- | --- |
+| A member and a signed-out visitor can't create, update or delete a step, and nothing changes | `who can change the steps > refuses a member and a signed-out visitor…` |
+| A switched-off step stays hidden from them when asked for by id | `… > hides a switched-off step…` |
+| Only an answer of exactly `true` from `access.edit` counts | `… > counts only an answer of exactly true…` |
+| A missing edit rule, a media collection without uploads and a malformed `scope` stop the config | `… > refuses at config time…` |
+| A blank stop message, a choice without one and a choice with fewer than two options are refused | `a step can't be saved… > refuses a blank stop message…` |
+| An update can't take away the stop message or the captions | `… > refuses an update that takes away…` |
+| A flow with no slots is refused | `… > refuses a flow with no slots…` |
+| An invented choice value, `seen` on a gate, and answers to a switched-off or another flow's step are refused | `more ways an answer check stays closed > refuses an invented choice value…` |
+| Answers of the wrong shape are refused | `… > refuses answers of any wrong shape` |
+| A flow named like a built-in object property is unknown | `… > treats a flow named like a built-in…` |
+| A failed read of the steps never passes | `… > never passes when the steps can't be read` |
+| The record keeps only the key, hash, answer and the server's question; `answersFor` makes no create or update; the plugin adds no collection for answers | `… > keeps only the key, hash, answer and question…` |
+| The page gets only a step's own fields | `… > gives the page only the step's own fields` |
+| Answers given before a step was added or switched off fail | `… > fails answers given before a step was added…` |
+| Replacing a step's video file fails earlier answers, through the real upload | `… > fails answers given before a step's video file was replaced` |
+| The hash also changes with the kind, an option's value or label, and the captions file | `what the security read found > changes the hash with every part…` (extended) |
+| With a scope, a failed read of the stored steps means no update or delete | `guardDb refuses… > writes nothing when the stored steps can't be read` |
+| An async scope hook is awaited, and a rejected or bad one is a 403 | `… > waits for an async scope hook…` |
+| An `indexWith` field the steps don't have stops start-up | `… > stops the site at start-up when indexWith…` |
+| No, or a stopping option, removes the earlier answer from what the flow holds | client `No, or a stopping option, after Back removes…` |
+| The component calls neither `fetch` nor `sendBeacon`; answers leave through `onFinish` | client `uses no web storage or cookies, and sends nothing itself` (extended) |
+
+Mutation check: 33 one-line changes to `src/`, with the source restored after each. 32 made a targeted test fail. The one that survived (the captions rule reading only the incoming data) changed nothing the tests could see on an update. It was replaced by running the captions and stop message rules on create only, and both of those were caught. Some new assertions have no change of their own.
+
+### Gaps skipped
+
+- A real browser, a screen reader and real video playback: jsdom checks the markup and focus, and the rest waits for a real-client pass.
+- 44px targets as drawn: the test reads the style's minimum height, since jsdom does no layout.
+- The contents of a captions file: the check is by file type, and `text/plain` is accepted along with `text/vtt`, so a text file that isn't WebVTT can be saved as captions.
+- Which problem a failed read reports: `answersFor` refuses, and calls it `unknownFlow`. The test checks the refusal.
+- Postgres, concurrent writes, a real multi-site host, and a plugin that wraps `db` before this one, as in the 2026-11-26 entries.
+- The Sample Kits and Scan pairings: the flow registration they rely on is tested with a made-up plugin.
+- Payload's own behavior, such as how it stores uploads and localized fields.
+
 ## 2026-11-10: after the security read
 
 | Promise | Test |

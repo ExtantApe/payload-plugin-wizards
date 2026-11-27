@@ -135,6 +135,27 @@ describe('<Wizard>', () => {
     expect(btn('Yes').textContent).not.toContain('(chosen)')
   })
 
+  it('No, or a stopping option, after Back removes the earlier answer from what the flow holds', () => {
+    for (const [safety, first, withdraw] of [[gateA, 'Yes', 'No'], [choice, 'Put it down', 'Still holding it']] as const) {
+      const seen: unknown[] = []
+      render(
+        <Wizard
+          slots={[{ code: 'look' }, { step: safety }, { step: gateB }]}
+          renderCode={{ look: (ctx) => { seen.push(ctx.answers); return <button type="button" onClick={() => ctx.next()}>Go</button> } }}
+          onFinish={() => {}}
+        />,
+      )
+      fireEvent.click(btn('Go'))
+      fireEvent.click(btn(first))
+      fireEvent.click(btn('Back'))
+      fireEvent.click(btn(withdraw))
+      expect(heading().textContent).toBe(`Question ${safety.key}?`)
+      fireEvent.click(btn('Back'))
+      expect(seen.at(-1), withdraw).toEqual([])
+      cleanup()
+    }
+  })
+
   it('changing an answer after Back replaces it rather than adding one', async () => {
     const onFinish = vi.fn()
     const twoOk = step({
@@ -296,8 +317,12 @@ describe('<Wizard>', () => {
     }
   })
 
-  it('uses no web storage or cookies', async () => {
+  it('uses no web storage or cookies, and sends nothing itself', async () => {
     const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    const sent = vi.fn()
+    vi.stubGlobal('fetch', sent)
+    const beacon = vi.fn()
+    Object.defineProperty(navigator, 'sendBeacon', { value: beacon, configurable: true })
     const cookieBefore = document.cookie
     render(
       <Wizard
@@ -314,6 +339,11 @@ describe('<Wizard>', () => {
     })
     expect(setItem).not.toHaveBeenCalled()
     expect(document.cookie).toBe(cookieBefore)
+    // Answers leave the page only through onFinish.
+    expect(sent).not.toHaveBeenCalled()
+    expect(beacon).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+    delete (navigator as { sendBeacon?: unknown }).sendBeacon
   })
 })
 
