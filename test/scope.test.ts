@@ -578,6 +578,56 @@ describe('the stored step is checked too, not only the incoming data', () => {
     expect(left.map((d) => d.key)).toEqual([])
   })
 
+  it('refuses a deleteOne or deleteMany that carries an id of the caller’s own step next to a where on another site’s', async () => {
+    const a = await stored('a-only')
+    const b = await stored('b-only')
+    const req = await reqOf(scoped, 'editorA')
+    const total = async () => (await scoped.count({ collection: 'guided-steps' as never, overrideAccess: true })).totalDocs
+    const before = await total()
+    await expect(anyDb().deleteOne({ collection: 'guided-steps', id: a.id, where: { id: { equals: b.id } }, req })).rejects.toMatchObject({ status: 403 })
+    await expect(anyDb().deleteMany({ collection: 'guided-steps', id: a.id, where: {}, req })).rejects.toMatchObject({ status: 403 })
+    expect(await total()).toBe(before)
+  })
+
+  it('refuses a db.updateOne with an empty id and a where on another site’s step', async () => {
+    const b = await stored('b-only')
+    const req = await reqOf(scoped, 'editorA')
+    await expect(anyDb().updateOne({ collection: 'guided-steps', id: '', where: { id: { equals: b.id } }, data: { site: 'a' }, req })).rejects.toMatchObject({ status: 403 })
+    await expect(anyDb().updateOne({ collection: 'guided-steps', id: 0, where: { id: { equals: b.id } }, data: { site: 'a' }, req })).rejects.toMatchObject({ status: 403 })
+    expect((await stored('b-only')).site).toBe('b')
+  })
+
+  it('calls the scope hook once for a db.updateOne and once for a db.deleteOne', async () => {
+    const a = await stored('a-only')
+    const req = await reqOf(scoped, 'editorA')
+    const saved = hook
+    let calls = 0
+    hook = (r) => { calls++; return saved(r) }
+    try {
+      await anyDb().updateOne({ collection: 'guided-steps', id: a.id, data: { site: 'a' }, req })
+      expect(calls).toBe(1)
+      calls = 0
+      await anyDb().deleteMany({ collection: 'guided-steps', where: { key: { equals: 'nothing-here' } }, req })
+      expect(calls).toBe(1)
+    } finally {
+      hook = saved
+    }
+  })
+
+  it('refuses a deleteMany with where {} inside a transaction as 403, and deletes nothing', async () => {
+    const req = (await reqOf(scoped, 'editorA')) as Doc
+    const total = async () => (await scoped.count({ collection: 'guided-steps' as never, overrideAccess: true })).totalDocs
+    const before = await total()
+    const txn = await scoped.db.beginTransaction?.()
+    if (txn) req.transactionID = txn
+    try {
+      await expect(anyDb().deleteMany({ collection: 'guided-steps', where: {}, req })).rejects.toMatchObject({ status: 403 })
+    } finally {
+      if (txn) await scoped.db.rollbackTransaction(txn as never)
+    }
+    expect(await total()).toBe(before)
+  })
+
   it('refuses db calls with no req while a scope is set, and leaves other collections alone', async () => {
     const b = await stored('b-only')
     await expect(anyDb().deleteOne({ collection: 'guided-steps', where: { id: { equals: b.id } } })).rejects.toMatchObject({ status: 403 })
@@ -650,8 +700,44 @@ describe('plugin order: the final database adapter must still carry the check', 
     await expect(boot(`order-wrap${n}`, [wrap])).rejects.toThrow(/Put .wizardsPlugin. last/)
   })
 
+  for (const name of ['updateMany', 'upsert', 'find', 'deleteOne', 'updateOne', 'deleteMany'])
+    it(`refuses to start when a later plugin wraps ${name} outside the check`, async () => {
+      const wrap = (c: Config): Config => ({ ...c, db: { ...c.db, init: (a: { payload: Payload }) => { const ad = c.db.init(a as never) as unknown as Doc; const inner = ad[name]; return { ...ad, [name]: (x: Doc) => inner.call(ad, x) } as never } } })
+      await expect(boot(`order-wrap-${name}${n}`, [wrap])).rejects.toThrow(new RegExp(`adapter's ${name} is not the one`))
+    })
+
   it('starts when no plugin touches db after it', async () => {
     await expect(boot(`order-ok${n}`, [])).resolves.toBeUndefined()
+  })
+})
+
+describe('a where on a localized field is counted in the locale the call uses', () => {
+  it('refuses a db.updateOne in locale es on a localized field that reaches another site’s step, on every database', async () => {
+    const key = `loc${n}`
+    const p = await getPayload({
+      key,
+      config: await buildConfig({
+        secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: makeDb(key),
+        localization: { locales: ['en', 'es'], defaultLocale: 'en' },
+        collections: [{ slug: 'users', auth: true, fields: [{ name: 'site', type: 'text' }] }],
+        plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, scope: { where: ({ req }) => ({ site: { equals: (req.user as { site?: string } | null)?.site } }), indexWith: ['site'] } }), siteField],
+      } as never),
+    })
+    try {
+      const mk = async (site: string, k: string) => {
+        const doc = (await p.create({ collection: 'guided-steps' as never, data: { flow: 'kit-activation', group: 'safety', kind: 'gate', stopMessage: 's', site, key: k, question: `en ${k}` } as never, user: { id: 'x', collection: 'users', site } as never, overrideAccess: true })) as Doc
+        await p.update({ collection: 'guided-steps' as never, id: doc.id, locale: 'es' as never, data: { question: `hola ${k}`, stopMessage: 'es' } as never, user: { id: 'x', collection: 'users', site } as never, overrideAccess: true })
+        return doc
+      }
+      await mk('a', 'one')
+      const b = await mk('b', 'two')
+      const req = await createLocalReq({ user: { id: 'x', collection: 'users', site: 'a' } as never }, p)
+      await expect((p.db as unknown as Doc).updateOne({ collection: 'guided-steps', where: { question: { equals: 'hola two' } }, locale: 'es', data: { site: 'a' }, req })).rejects.toMatchObject({ status: 403 })
+      const after = (await p.findByID({ collection: 'guided-steps' as never, id: b.id, overrideAccess: true })) as Doc
+      expect(after.site).toBe('b')
+    } finally {
+      await p.destroy()
+    }
   })
 })
 
@@ -661,15 +747,15 @@ describe('plugin order: the final database adapter must still carry the check', 
 describe('guardDb refuses what it can’t guard', () => {
   const o = { scope: { where: () => ({ site: { equals: 'a' } }) }, slug: 'guided-steps', flows: {}, edit: () => true, media: false, adminGroup: 'Wizards' } as never
   const fn = async () => ({})
-  const full = { count: fn, create: fn, updateOne: fn, deleteOne: fn, deleteMany: fn }
-  const init = (adapter: Record<string, unknown>) => (guardDb(o, { init: () => adapter } as never) as { init: (a: never) => unknown }).init({} as never)
+  const full = { find: fn, create: fn, updateOne: fn, deleteOne: fn, deleteMany: fn }
+  const init = (adapter: Record<string, unknown>) => (guardDb(o, { init: () => ({ ...adapter }) } as never) as { init: (a: never) => unknown }).init({} as never)
 
   it('throws when db is missing, or has no init', () => {
     expect(() => guardDb(o, undefined)).toThrow(/needs `db` set before this plugin/)
     expect(() => guardDb(o, {} as never)).toThrow(/needs `db` set before this plugin/)
   })
 
-  it('throws when the adapter lacks count, create, updateOne, deleteOne or deleteMany, naming it', () => {
+  it('throws when the adapter lacks find, create, updateOne, deleteOne or deleteMany, naming it', () => {
     for (const name of Object.keys(full)) {
       const { [name]: _gone, ...rest } = full as Record<string, unknown>
       expect(() => init(rest)).toThrow(new RegExp(`no ${name}`))
@@ -687,6 +773,35 @@ describe('guardDb refuses what it can’t guard', () => {
     expect(new ScopeError('x').status).toBe(403)
     const wrapped = init(full) as Doc
     await expect(wrapped.create({ collection: 'guided-steps', data: { site: 'a' } })).rejects.toMatchObject({ status: 403, isPublic: true })
+  })
+
+  it('hands the adapter a where with the scope in it and no id, so the write itself stays inside the scope', async () => {
+    const seen: Doc[] = []
+    const spy = (name: string) => async (a: Doc) => { seen.push({ name, ...a }); return name === 'find' ? { docs: [] } : {} }
+    const wrapped = init({ find: spy('find'), create: spy('create'), updateOne: spy('updateOne'), deleteOne: spy('deleteOne'), deleteMany: spy('deleteMany') }) as Doc
+    const req = {}
+    await wrapped.updateOne({ collection: 'guided-steps', id: 'x1', data: { site: 'a' }, req })
+    await wrapped.updateOne({ collection: 'guided-steps', id: '', where: { key: { equals: 'k' } }, data: { site: 'a' }, req })
+    await wrapped.deleteOne({ collection: 'guided-steps', id: 'x2', where: { key: { equals: 'k' } }, req })
+    await wrapped.deleteMany({ collection: 'guided-steps', where: {}, req })
+    const writes = seen.filter((s) => s.name !== 'find')
+    expect(writes.map((w) => w.name)).toEqual(['updateOne', 'updateOne', 'deleteOne', 'deleteMany'])
+    for (const w of writes) {
+      expect(w.id).toBeUndefined()
+      expect(JSON.stringify(w.where)).toContain('"site":{"equals":"a"}')
+    }
+    expect(JSON.stringify(writes[0]!.where)).toContain('"id":{"equals":"x1"}')
+    expect(JSON.stringify(writes[1]!.where)).toContain('"key"')
+    expect(JSON.stringify(writes[2]!.where)).not.toContain('x2')
+  })
+
+  it('passes the call’s locale to the read of the stored steps', async () => {
+    const seen: Doc[] = []
+    const counter = async (a: Doc) => { seen.push(a); return { docs: [] } }
+    const wrapped = init({ ...full, find: counter }) as Doc
+    await wrapped.updateOne({ collection: 'guided-steps', where: { key: { equals: 'k' } }, locale: 'es', data: { site: 'a' }, req: {} })
+    expect(seen.length).toBeGreaterThan(0)
+    for (const s of seen) expect(s.locale).toBe('es')
   })
 
   it('refuses at config time when a scope is set and no db is given', async () => {

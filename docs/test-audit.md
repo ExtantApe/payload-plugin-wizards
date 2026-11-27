@@ -82,8 +82,12 @@ Gaps skipped: a plugin that replaces `db` after Wizards (the README says to set 
 | With a scope set the site refuses to start if the steps have `versions: true`, drafts or drafts with autosave; with no scope they are allowed | `versions and drafts are refused…` |
 | A draft or autosave write, a draft create and a REST `PATCH ?draft=true` can't move a step to another site; `findVersions` returns nothing of another site | same group (locks: they passed before, because the steps had no versions) |
 | The site refuses to start when a later plugin restores the original `config.db` or wraps `create` outside the check | `plugin order…` |
-| The start-up throws for a missing `db` and for an adapter without `count`, `create`, `updateOne`, `deleteOne` or `deleteMany`, and the 403 status | `guardDb refuses what it can't guard` |
+| The start-up throws for a missing `db` and for an adapter without `find`, `create`, `updateOne`, `deleteOne` or `deleteMany`, and the 403 status | `guardDb refuses what it can't guard` |
 
 Failing-first: against the previous `src/`, 38 of the 65 new tests failed (the stored-step, versions, plugin order and two adapter tests). The other 27 are locks that pass on both: the no-scope control, own-site calls, the draft and findVersions tests, and the start-up refusals that already existed. Those were checked by mutation instead: removing the missing-`db` throw, the missing-method throw, the stored-step check, the versions check or the guarded-function check, or changing 403 to 400, each makes tests fail.
 
 Gaps skipped: Postgres, two writes at once (the stored-step check reads first and writes after), a plugin that wraps `db` before this one (it can't be detected, so the README says to list this plugin last), and the admin autosave UI.
+
+## 2026-11-26: stored-step check by the adapter's own target
+
+Covered, added: a `deleteOne` or `deleteMany` with an `id` next to a `where` on another site; `updateOne` with an empty or zero `id`; a `where` on a localized field in locale `es` (SQLite errored, Mongo let it through); `deleteMany` with `where: {}` inside a transaction (403, not a driver error); the scope hook called once per adapter call; the write handed a `where` that holds the scope and no `id`; a start-up refusal when a later plugin wraps `find`, `updateMany`, `upsert`, `updateOne`, `deleteOne` or `deleteMany` (dropping `updateMany` and `upsert` from the start-up check now fails two tests on each database). Skipped: concurrent writes, which need a real multi-site host.

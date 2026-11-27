@@ -94,9 +94,8 @@ const withScope = async (o: Resolved, req: Req, result: boolean | Where): Promis
 }
 
 /** Refuses, before anything is saved, a step that would sit outside the caller's scope. */
-const checkWrite = async (o: Resolved, next: Doc, req: Req) => {
-  const scope = await scopeOf(o, req)
-  if (scope && !matches(next, scope)) throw new ScopeError('This step would be outside your scope.')
+const checkWrite = (next: Doc, scope: Where) => {
+  if (!matches(next, scope)) throw new ScopeError('This step would be outside your scope.')
 }
 
 type Method = (this: unknown, args: Doc) => Promise<unknown>
@@ -105,27 +104,41 @@ type Method = (this: unknown, args: Doc) => Promise<unknown>
 const guarded = new WeakSet<Method>()
 const checked = ['create', 'updateOne', 'deleteOne', 'deleteMany'] as const
 const refused = ['updateMany', 'upsert'] as const
+/** Passed straight through, but marked: the stored-step check reads with `find`, so a later plugin that wraps it would be noticed. */
+const watched = ['find'] as const
+
+/** Whether an object has anything in it. */
+const hasKeys = (w: Where | undefined): w is Where => Boolean(w) && Object.keys(w as object).length > 0
 
 /**
- * Refuses a write or delete that would touch a step stored outside the caller's scope. Reads the stored steps the
- * call would touch (by id or by where) and refuses unless every one of them is inside the scope. Runs for
- * `overrideAccess: true` calls and direct adapter calls too.
+ * What the adapter will act on, worked out the way the adapters do: `updateOne` uses `id` when it is truthy and the
+ * `where` otherwise; `deleteOne` and `deleteMany` use only the `where` and ignore an `id`.
  */
-const checkStored = async (adapter: Record<string, Method | undefined>, o: Resolved, a: Doc) => {
-  const scope = await scopeOf(o, a.req as Req)
-  if (!scope) return
-  const base: Where = a.id !== undefined && a.id !== null ? { id: { equals: a.id } } : ((a.where as Where | undefined) ?? {})
-  const count = async (where: Where) => ((await adapter.count!.call(adapter, { collection: o.slug, where, req: a.req })) as { totalDocs: number }).totalDocs
-  const all = await count(base)
-  if (all && (await count({ and: [base, scope] })) !== all) throw new ScopeError('This step is outside your scope.')
+const targetOf = (name: string, a: Doc): Where | undefined => (name === 'updateOne' && a.id ? { id: { equals: a.id } } : (a.where as Where | undefined))
+
+/**
+ * Reads the stored steps the call would touch and refuses unless every one of them is inside the scope. It reads in
+ * the locale the call uses, so a `where` on a localized field means the same here as in the write, and it reads with
+ * `find`, which every database allows inside a transaction.
+ */
+const checkStored = async (adapter: Record<string, Method | undefined>, o: Resolved, a: Doc, target: Where | undefined, scope: Where) => {
+  const locale = a.locale ?? (a.req as Req | undefined)?.locale
+  const howMany = async (where: Where) =>
+    ((await adapter.find!.call(adapter, { collection: o.slug, where, locale, limit: 0, pagination: false, select: { id: true }, req: a.req })) as { docs: unknown[] }).docs.length
+  const base: Where = hasKeys(target) ? target : {}
+  const all = await howMany(base)
+  if (all && (await howMany(hasKeys(target) ? { and: [base, scope] } : scope)) !== all) throw new ScopeError('This step is outside your scope.')
 }
 
 /**
  * Puts the scope check at the one place every save passes last: the database adapter's create and update, which
  * receive the step exactly as it will be stored, after every field hook and every collection hook any plugin added,
- * whatever order the plugins run in. An update or delete also reads the stored step and refuses unless it is inside
- * the scope, so a call can't move another site's step into its own site or delete it. A bulk update or an upsert
- * straight on the adapter is refused while a scope is set. Plugins that wrap `db` must run before this one.
+ * whatever the plugins do before the adapter is called. An update or delete also reads the stored steps and refuses
+ * unless every one is inside the scope, so a call can't move another site's step into its own site or delete it, and
+ * the write itself is handed the scope in its `where` (and no `id`), so a step that changes between the read and the
+ * write is still not touched. A bulk update or an upsert straight on the adapter is refused while a scope is set. A
+ * plugin that wraps `db` and is listed before this one runs after the check on `create`, `updateOne`, `deleteOne`
+ * and `deleteMany`, so its changes to those calls are not checked.
  */
 export const guardDb = (o: Resolved, db: Config['db'] | undefined): Config['db'] => {
   if (!o.scope) return db as Config['db']
@@ -134,16 +147,31 @@ export const guardDb = (o: Resolved, db: Config['db'] | undefined): Config['db']
     ...db,
     init: (args) => {
       const adapter = db.init(args) as unknown as Record<string, Method | undefined>
-      if (typeof adapter.count !== 'function') throw new Error("Wizards: the database adapter has no count, so the scope can't be enforced.")
+      for (const name of watched) {
+        const original = adapter[name]
+        if (typeof original !== 'function') throw new Error(`Wizards: the database adapter has no ${name}, so the scope can't be enforced.`)
+        const wrapped: Method = function (this: unknown, a: Doc) {
+          return original.call(this, a)
+        }
+        guarded.add(wrapped)
+        adapter[name] = wrapped
+      }
       for (const name of checked) {
         const original = adapter[name]
         if (typeof original !== 'function') throw new Error(`Wizards: the database adapter has no ${name}, so the scope can't be enforced.`)
         const wrapped: Method = async function (this: unknown, a: Doc) {
-          if (a?.collection === o.slug) {
-            if (name === 'create' || name === 'updateOne') await checkWrite(o, (a.data ?? {}) as Doc, a.req as Req)
-            if (name !== 'create') await checkStored(adapter, o, a)
+          if (a?.collection !== o.slug) return original.call(this, a)
+          const scope = await scopeOf(o, a.req as Req)
+          if (!scope) return original.call(this, a)
+          if (name === 'create') {
+            checkWrite((a.data ?? {}) as Doc, scope)
+            return original.call(this, a)
           }
-          return original.call(this, a)
+          if (name === 'updateOne') checkWrite((a.data ?? {}) as Doc, scope)
+          const target = targetOf(name, a)
+          await checkStored(adapter, o, a, target, scope)
+          const { id: _id, ...rest } = a
+          return original.call(this, { ...rest, where: hasKeys(target) ? { and: [target, scope] } : scope })
         }
         guarded.add(wrapped)
         adapter[name] = wrapped
@@ -171,7 +199,7 @@ export const guardDb = (o: Resolved, db: Config['db'] | undefined): Config['db']
 export const assertGuarded = (o: Resolved, payload: Payload) => {
   if (!o.scope) return
   const db = payload.db as unknown as Record<string, Method | undefined>
-  for (const name of [...checked, ...refused]) {
+  for (const name of [...watched, ...checked, ...refused]) {
     const fn = db[name]
     if (typeof fn === 'function' && !guarded.has(fn))
       throw new Error(`Wizards: the database adapter's ${name} is not the one this plugin wrapped, so the scope isn't enforced. Another plugin replaced or re-wrapped \`db\`. Put \`wizardsPlugin\` last among the plugins that touch \`db\`.`)
