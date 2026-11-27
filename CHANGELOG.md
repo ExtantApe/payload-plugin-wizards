@@ -12,6 +12,10 @@ Tested: 427 tests in all, on the same four databases, with new tests for each of
 
 Third review round: `updateOne` on the adapter with `upsert` set (top level or in `options`) is refused while a scope is set, the same as `upsert` itself. Before, a `where` that matched nothing inserted a new step. The data check still kept it inside the caller's site, but the README promised upserts were refused. Tested: a new test on each of the four databases, which checks that both forms return 403 and insert nothing. Not tested: Postgres.
 
+Test audit: 19 more tests, with no change to the plugin's code. They cover who can change steps, config-time and save-time refusals, more refusals in `answersFor`, a failed read, what the record keeps, a replaced video file, an async scope hook, and a component that withdraws answers and sends nothing itself.
+
+Tested: 450 tests on in-memory MongoDB, SQLite and jsdom, the typecheck, the build, and 32 of 33 one-line source changes caught (see `docs/test-audit.md`). Not tested: Postgres, concurrent writes, a real browser or screen reader, a real site.
+
 ## 0.1.0 (unreleased)
 
 First version, from design 0001: guided steps edited in the admin with a content hash, flows registered by code (and by other plugins), `flowSteps`, the `<Wizard>` component (one question per screen, gates, choices, captioned video, code steps, in-memory state), and `answersFor`, which checks every answer on the server before the owner acts.

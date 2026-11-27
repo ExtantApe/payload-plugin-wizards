@@ -5,9 +5,10 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import { answersFor, contentHash, flowSteps, wizardsPlugin, type Answer, type FlowRegistration } from '../src/index.js'
+import { answersFor, contentHash, flowSteps, flowsOf, wizardsPlugin, type Answer, type FlowRegistration } from '../src/index.js'
+import { stepsCollection } from '../src/steps.js'
 
 // A made-up kit activation flow, with safety steps edited in the admin.
 type Doc = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -41,7 +42,7 @@ beforeAll(async () => {
       ],
       plugins: [
         wizardsPlugin({
-          flows: { 'kit-activation': { slots: [{ code: 'find-kit' }, { steps: 'safety' }, { code: 'sampled' }] }, 'nobody-home': { slots: [{ steps: 'not-seeded' }] } },
+          flows: { 'kit-activation': { slots: [{ code: 'find-kit' }, { steps: 'safety' }, { code: 'sampled' }] }, 'nobody-home': { slots: [{ steps: 'not-seeded' }] }, audit: { slots: [{ steps: 'audit' }] } },
           access: { edit: ({ req }) => (req.user as { role?: string } | null)?.role === 'editor' },
         }),
         // Another plugin registers a flow after Wizards, with no import.
@@ -135,7 +136,7 @@ describe('what the security read found', () => {
   it('changes the hash with every part a person confirms: wording, options, stop message, video and captions', () => {
     const base = { question: 'q', body: 'b', kind: 'choice', options: [{ value: 'y', label: 'Yes' }, { value: 'n', label: 'No', stops: true }], stopMessage: 's', video: { id: 'v1', updatedAt: 't1' }, captions: { id: 'c1', updatedAt: 't1' } }
     const h = contentHash(base)
-    for (const change of [{ question: 'q2' }, { body: 'b2' }, { stopMessage: 's2' }, { options: [{ value: 'y', label: 'Yes' }, { value: 'n', label: 'No' }] }, { video: { id: 'v2', updatedAt: 't1' } }, { video: { id: 'v1', updatedAt: 't2' } }, { captions: { id: 'c2', updatedAt: 't1' } }, { video: null }])
+    for (const change of [{ question: 'q2' }, { body: 'b2' }, { stopMessage: 's2' }, { options: [{ value: 'y', label: 'Yes' }, { value: 'n', label: 'No' }] }, { video: { id: 'v2', updatedAt: 't1' } }, { video: { id: 'v1', updatedAt: 't2' } }, { captions: { id: 'c2', updatedAt: 't1' } }, { video: null }, { captions: { id: 'c1', updatedAt: 't2' } }, { captions: null }, { kind: 'gate' }, { options: [{ value: 'y2', label: 'Yes' }, { value: 'n', label: 'No', stops: true }] }, { options: [{ value: 'y', label: 'Yes, all of it' }, { value: 'n', label: 'No', stops: true }] }])
       expect(contentHash({ ...base, ...change }), JSON.stringify(change)).not.toBe(h)
     expect(contentHash({ ...base })).toBe(h)
   })
@@ -178,5 +179,158 @@ describe('what the security read found', () => {
 
   it('refuses at start-up a flow that uses one group of steps twice', async () => {
     await expect(getPayload({ key: 'twice', config: await buildConfig({ secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: mongooseAdapter({ url: mongo.getUri('wizards-twice') }), collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows: { f: { slots: [{ steps: 'safety' }, { code: 'x' }, { steps: 'safety' }] } }, access: { edit: () => true }, media: false })] }) } as never)).rejects.toThrow(/group of steps twice/)
+  })
+})
+
+describe('who can change the steps', () => {
+  const stored = async (key: string) => (await payload.find({ collection: 'guided-steps' as never, where: { key: { equals: key } } as never, overrideAccess: true })).docs[0] as Doc
+
+  it('refuses a member and a signed-out visitor to create, update or delete, and changes nothing', async () => {
+    const before = await stored('one-animal')
+    const total = async () => (await payload.count({ collection: 'guided-steps' as never, overrideAccess: true })).totalDocs
+    const count = await total()
+    for (const who of [member, null]) {
+      await expect(payload.create({ collection: 'guided-steps' as never, data: { flow: 'kit-activation', group: 'safety', key: 'uninvited', kind: 'gate', question: 'q', stopMessage: 's' } as never, ...as(who) })).rejects.toMatchObject({ status: 403 })
+      await expect(payload.update({ collection: 'guided-steps' as never, id: before.id, data: { active: false } as never, ...as(who) })).rejects.toMatchObject({ status: 403 })
+      await expect(payload.delete({ collection: 'guided-steps' as never, id: before.id, ...as(who) })).rejects.toMatchObject({ status: 403 })
+    }
+    expect(await total()).toBe(count)
+    expect((await stored('one-animal')).active).toBe(true)
+  })
+
+  it('hides a switched-off step from a member and a signed-out visitor, asked for by id', async () => {
+    const off = await stored('old')
+    for (const who of [member, null]) await expect(payload.findByID({ collection: 'guided-steps' as never, id: off.id, ...as(who) })).rejects.toThrow()
+    await expect(payload.findByID({ collection: 'guided-steps' as never, id: off.id, ...as(editor) })).resolves.toMatchObject({ key: 'old' })
+  })
+
+  it('counts only an answer of exactly true from access.edit', async () => {
+    for (const answer of ['yes', 1, {}, { id: { exists: true } }, undefined, null, false]) {
+      const access = stepsCollection({ slug: 'guided-steps', flows: {}, edit: () => answer as never, media: false, adminGroup: 'Wizards' }).access as Record<string, (a: unknown) => Promise<unknown>>
+      for (const op of ['create', 'update', 'delete']) expect(await access[op]!({ req: {} }), `${op}: ${JSON.stringify(answer)}`).toBe(false)
+      expect(await access.read!({ req: {} }), `read: ${JSON.stringify(answer)}`).toEqual({ active: { equals: true } })
+    }
+  })
+
+  it('refuses at config time a missing edit rule, a media collection that takes no uploads, and a malformed scope option', () => {
+    const base = { collections: [{ slug: 'media', fields: [] }] } as never
+    const edit = () => true
+    expect(() => wizardsPlugin({} as never)(base)).toThrow(/access\.edit/)
+    expect(() => wizardsPlugin({ access: {} } as never)(base)).toThrow(/access\.edit/)
+    expect(() => wizardsPlugin({ access: { edit } })(base)).toThrow(/isn't an upload collection/)
+    expect(() => wizardsPlugin({ access: { edit }, media: 'nowhere' })(base)).toThrow(/isn't an upload collection/)
+    expect(() => wizardsPlugin({ access: { edit }, media: false, scope: {} as never })(base)).toThrow(/scope\.where/)
+    for (const indexWith of ['site', [''], [1]]) expect(() => wizardsPlugin({ access: { edit }, media: false, scope: { where: () => ({}), indexWith: indexWith as never } })(base), JSON.stringify(indexWith)).toThrow(/indexWith/)
+  })
+})
+
+describe('a step can’t be saved in a state that would weaken a flow', () => {
+  const mine = (data: Doc) => step({ flow: 'audit', group: 'rules', question: 'q', ...data })
+  const choice = [{ value: 'a', label: 'A' }, { value: 'b', label: 'B', stops: true }]
+
+  it('refuses a blank stop message, a choice with no stop message and a choice with fewer than two options', async () => {
+    await expect(mine({ key: 'blank-stop', stopMessage: '   \n ' })).rejects.toThrow(/stop message/)
+    await expect(mine({ key: 'choice-no-stop', kind: 'choice', options: choice, stopMessage: '' })).rejects.toThrow(/stop message/)
+    await expect(mine({ key: 'no-options', kind: 'choice' })).rejects.toThrow(/at least two options/)
+    await expect(mine({ key: 'one-option', kind: 'choice', options: [{ value: 'a', label: 'A' }] })).rejects.toThrow(/at least two options/)
+  })
+
+  it('refuses an update that takes away the stop message or the captions, and keeps what was stored', async () => {
+    const file = (name: string, mimetype: string) => payload.create({ collection: 'media' as never, data: {} as never, file: { data: Buffer.from('made-up'), mimetype, name, size: 7 }, overrideAccess: true }) as Promise<Doc>
+    const doc = await mine({ key: 'kept', video: (await file('kept.mp4', 'video/mp4')).id, captions: (await file('kept.vtt', 'text/vtt')).id })
+    const change = (data: Doc) => payload.update({ collection: 'guided-steps' as never, id: doc.id, data: data as never, ...as(editor) })
+    await expect(change({ stopMessage: '' })).rejects.toThrow(/stop message/)
+    await expect(change({ captions: null })).rejects.toThrow(/captions/)
+    const after = (await payload.findByID({ collection: 'guided-steps' as never, id: doc.id, depth: 0, overrideAccess: true })) as Doc
+    expect([after.stopMessage, Boolean(after.captions)]).toEqual(['Do this first, then press Yes.', true])
+  })
+
+  it('refuses a flow with no slots, from the site or from another plugin', () => {
+    const site = (flows: unknown, wizardFlows?: unknown) => ({ config: { custom: { wizards: { flows }, wizardFlows } } }) as never
+    expect(() => flowsOf(site({ f: { slots: [] } }))).toThrow(/from the site has no slots/)
+    expect(() => flowsOf(site({ f: {} }))).toThrow(/has no slots/)
+    expect(() => flowsOf(site({}, [{ owner: 'events', flows: { g: { slots: [] } } }]))).toThrow(/from events has no slots/)
+  })
+})
+
+describe('more ways an answer check stays closed, and what it keeps', () => {
+  const edit = async (key: string, data: Doc) => {
+    const [doc] = (await payload.find({ collection: 'guided-steps' as never, where: { key: { equals: key } } as never, overrideAccess: true })).docs as Doc[]
+    await payload.update({ collection: 'guided-steps' as never, id: doc!.id, data: data as never, ...as(editor) })
+  }
+
+  it('refuses an invented choice value, "seen" on a gate, and answers to a switched-off or other flow’s step', async () => {
+    const good = await yesTo()
+    const swap = (key: string, value: string) => good.map((a) => (a.key === key ? { ...a, value } : a))
+    const check = (answers: unknown) => answersFor(payload, { flow: 'kit-activation', answers })
+    expect(await check(swap('sealed', 'maybe'))).toMatchObject({ ok: false, problem: 'notYes', key: 'sealed' })
+    expect(await check(swap('one-animal', 'seen'))).toMatchObject({ ok: false, problem: 'notYes', key: 'one-animal' })
+    for (const key of ['old', 'arrived']) expect(await check([...good, { key, hash: 'x', value: 'yes' }])).toMatchObject({ ok: false, problem: 'extra', key })
+  })
+
+  it('refuses answers of any wrong shape', async () => {
+    for (const answers of [undefined, null, {}, [null], ['yes'], [{ key: 'one-animal', value: 'yes' }], [{ key: 'one-animal', hash: 'x' }], [{ key: 'one-animal', hash: 'x', value: true }], [{ key: 'one-animal', hash: 1, value: 'yes' }]])
+      expect(await answersFor(payload, { flow: 'kit-activation', answers }), JSON.stringify(answers) ?? 'undefined').toEqual({ ok: false, problem: 'badAnswers' })
+  })
+
+  it('treats a flow named like a built-in object property as unknown', async () => {
+    for (const flow of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+      await expect(flowSteps(payload, { flow }), flow).rejects.toThrow(/no flow/)
+      expect(await answersFor(payload, { flow, answers: [] }), flow).toMatchObject({ ok: false, problem: 'unknownFlow' })
+    }
+  })
+
+  it('never passes when the steps can’t be read', async () => {
+    const answers = await yesTo()
+    const spy = vi.spyOn(payload, 'find').mockRejectedValueOnce(new Error('database down'))
+    try {
+      expect((await answersFor(payload, { flow: 'kit-activation', answers })).ok).toBe(false)
+      expect(spy).toHaveBeenCalledTimes(1)
+    } finally {
+      spy.mockRestore()
+    }
+    expect((await answersFor(payload, { flow: 'kit-activation', answers })).ok).toBe(true) // the control
+  })
+
+  it('keeps only the key, hash, answer and question in the record, writes nothing, and adds no collection for answers', async () => {
+    const answers = (await yesTo()).map((a) => ({ ...a, note: 'made-up extra the client sent', question: 'made-up wording from the client' }))
+    const writes = (['create', 'updateOne', 'updateMany', 'upsert'] as const).map((name) => vi.spyOn(payload.db, name as 'create'))
+    try {
+      const r = await answersFor(payload, { flow: 'kit-activation', answers })
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      expect(Object.keys(r.record).sort()).toEqual(['answers', 'at', 'flow', 'locale'])
+      for (const a of r.record.answers) expect(Object.keys(a).sort()).toEqual(['hash', 'key', 'question', 'value'])
+      expect(JSON.stringify(r.record)).not.toContain('made-up')
+      for (const w of writes) expect(w).not.toHaveBeenCalled()
+    } finally {
+      for (const w of writes) w.mockRestore()
+    }
+    expect(payload.config.collections.map((c) => c.slug).filter((s) => !s.startsWith('payload-')).sort()).toEqual(['guided-steps', 'media', 'users'])
+  })
+
+  it('gives the page only the step’s own fields', async () => {
+    const { slots } = await flowSteps(payload, { flow: 'kit-activation' })
+    for (const s of slots) if ('step' in s) expect(Object.keys(s.step).sort()).toEqual(['body', 'group', 'hash', 'key', 'kind', 'options', 'question', 'stopMessage', 'video'])
+  })
+
+  it('fails answers given before a step was added or switched off', async () => {
+    const before = await yesTo()
+    await step({ key: 'late-rule', order: 6, question: 'A rule added later?' })
+    expect(await answersFor(payload, { flow: 'kit-activation', answers: before })).toMatchObject({ ok: false, problem: 'missing', key: 'late-rule' })
+    await edit('late-rule', { active: false })
+    const withIt = [...before, { key: 'late-rule', hash: 'x', value: 'yes' }]
+    expect(await answersFor(payload, { flow: 'kit-activation', answers: withIt })).toMatchObject({ ok: false, problem: 'extra', key: 'late-rule' })
+  })
+
+  it('fails answers given before a step’s video file was replaced', async () => {
+    const file = (name: string, mimetype: string) => ({ data: Buffer.from('made-up'), mimetype, name, size: 7 })
+    const upload = (name: string, mimetype: string) => payload.create({ collection: 'media' as never, data: {} as never, file: file(name, mimetype), overrideAccess: true }) as Promise<Doc>
+    const video = await upload('first.mp4', 'video/mp4')
+    await step({ flow: 'audit', group: 'audit', key: 'watched', question: 'Did you watch it?', video: video.id, captions: (await upload('first.vtt', 'text/vtt')).id })
+    const before = await yesTo('audit')
+    expect((await answersFor(payload, { flow: 'audit', answers: before })).ok).toBe(true)
+    await payload.update({ collection: 'media' as never, id: video.id, data: {} as never, file: file('second.mp4', 'video/mp4'), overrideAccess: true })
+    expect(await answersFor(payload, { flow: 'audit', answers: before })).toMatchObject({ ok: false, problem: 'changed', key: 'watched' })
   })
 })

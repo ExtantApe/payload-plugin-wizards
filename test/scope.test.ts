@@ -812,6 +812,38 @@ describe('guardDb refuses what it can’t guard', () => {
     for (const s of seen) expect(s.locale).toBe('es')
   })
 
+  it('writes nothing when the stored steps can’t be read', async () => {
+    const write = vi.fn(async () => ({}))
+    const down = async () => { throw new Error('database down') }
+    const wrapped = init({ find: down, create: write, updateOne: write, deleteOne: write, deleteMany: write }) as Doc
+    await expect(wrapped.updateOne({ collection: 'guided-steps', id: 'x1', data: { site: 'a' }, req: {} })).rejects.toThrow(/database down/)
+    await expect(wrapped.deleteOne({ collection: 'guided-steps', where: { id: { equals: 'x1' } }, req: {} })).rejects.toThrow(/database down/)
+    await expect(wrapped.deleteMany({ collection: 'guided-steps', where: {}, req: {} })).rejects.toThrow(/database down/)
+    expect(write).not.toHaveBeenCalled()
+  })
+
+  it('waits for an async scope hook, and refuses with a 403 when it rejects', async () => {
+    const write = vi.fn(async () => ({}))
+    const run = (where: () => Promise<unknown>) => {
+      const db = guardDb({ ...(o as object), scope: { where } } as never, { init: () => ({ find: fn, create: write, updateOne: fn, deleteOne: fn, deleteMany: fn }) } as never) as unknown as { init: (a: never) => Doc }
+      return db.init({} as never).create({ collection: 'guided-steps', data: { site: 'a' }, req: {} }) as Promise<unknown>
+    }
+    await expect(run(async () => { throw new Error('no site') })).rejects.toMatchObject({ status: 403 })
+    await expect(run(async () => ({}))).rejects.toMatchObject({ status: 403 })
+    await expect(run(async () => ({ site: { equals: 'b' } }))).rejects.toMatchObject({ status: 403 })
+    expect(write).not.toHaveBeenCalled()
+    await run(async () => ({ site: { equals: 'a' } }))
+    expect(write).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops the site at start-up when indexWith names a field the steps don’t have', async () => {
+    const start = async () => {
+      const p = await getPayload({ key: 'no-index-field', config: await buildConfig({ secret: 's', telemetry: false, typescript: { autoGenerate: false }, db: sqliteAdapter({ client: { url: `file:${join(sqliteDir, 'no-index-field.db')}` } }), collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }), indexWith: ['site'] } })] }) } as never)
+      await p.destroy()
+    }
+    await expect(start()).rejects.toThrow(/site was not found/)
+  })
+
   it('refuses at config time when a scope is set and no db is given', async () => {
     await expect(buildConfig({ secret: 's', telemetry: false, collections: [{ slug: 'users', auth: true, fields: [] }], plugins: [wizardsPlugin({ flows, access: { edit: () => true }, media: false, scope: { where: () => ({ site: { equals: 'a' } }) } })] } as never)).rejects.toThrow(/needs `db` set before this plugin/)
   })
