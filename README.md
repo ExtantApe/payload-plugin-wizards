@@ -2,7 +2,7 @@
 
 Wizards for Payload: gated step-by-step flows, one question per screen with Yes needed to go on, a video and text per step edited in the admin, and the answers checked on the server and recorded.
 
-**Status:** 0.1.0, not on npm yet. 450 tests pass: 29 server tests on Payload 3.92 with an in-memory MongoDB, 402 for the scope option, mostly run on MongoDB and SQLite, and 19 component tests in jsdom. No site uses it yet, and nothing has run in a real browser.
+**Status:** early (0.x). 475 tests pass: 29 server tests on Payload 3.92 with an in-memory MongoDB, 13 on SQLite for blank text, 402 for the scope option, mostly run on MongoDB and SQLite, and 31 component tests in jsdom. It hasn't been tested on a real site, and nothing has run in a real browser.
 
 ## What it does
 

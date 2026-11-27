@@ -1,6 +1,6 @@
 {
   "name": "@extantape/payload-plugin-wizards",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Wizards for Payload: gated step-by-step flows, one question per screen with Yes needed to go on, a video and text per step edited in the admin, and the answers checked on the server and recorded.",
   "homepage": "https://github.com/ExtantApe/payload-plugin-wizards#readme",
   "bugs": {
