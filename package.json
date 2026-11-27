@@ -59,6 +59,7 @@
   },
   "devDependencies": {
     "@payloadcms/db-mongodb": "3.92.1",
+    "@payloadcms/graphql": "3.92.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^24.0.0",
     "@types/react": "^19.3.0",

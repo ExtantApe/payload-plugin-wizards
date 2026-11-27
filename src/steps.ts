@@ -1,8 +1,58 @@
 import { createHash } from 'node:crypto'
 
-import type { CollectionBeforeChangeHook, CollectionConfig, CollectionSlug, Payload } from 'payload'
+import type { CollectionAfterChangeHook, CollectionBeforeChangeHook, CollectionConfig, CollectionSlug, Payload, PayloadRequest, Where } from 'payload'
 
-import type { Answer, Flow, FlowRegistration, Resolved, Step, WizardRecord } from './types.js'
+import type { Answer, Flow, FlowRegistration, Req, Resolved, Step, WizardRecord } from './types.js'
+
+/** The scope could not be worked out, so the call is refused. */
+export class ScopeError extends Error {}
+
+const isPlain = (v: unknown): v is Where => {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  const proto = Object.getPrototypeOf(v)
+  return (proto === Object.prototype || proto === null) && Object.keys(v).length > 0
+}
+
+/**
+ * The caller's scope: `null` when the host set none (0.1.0 behavior), otherwise its `where`. Fails closed: no
+ * request, a hook that throws, or anything but a non-empty plain object raises ScopeError.
+ */
+const scopeOf = async (o: Resolved, req: Req | undefined): Promise<Where | null> => {
+  if (!o.scope) return null
+  if (!req) throw new ScopeError('Wizards: a scope is set, so this call needs `req`.')
+  let w: unknown
+  try {
+    w = await o.scope.where({ req: req as PayloadRequest })
+  } catch {
+    throw new ScopeError('Wizards: the scope hook threw, so the call is refused.')
+  }
+  if (!isPlain(w)) throw new ScopeError('Wizards: the scope hook must return a non-empty object, so the call is refused.')
+  return w
+}
+
+/** An access result with the scope ANDed in. `false` stays false; a failing scope refuses. */
+const withScope = async (o: Resolved, req: Req, result: boolean | Where): Promise<boolean | Where> => {
+  if (result === false) return false
+  let scope: Where | null
+  try {
+    scope = await scopeOf(o, req)
+  } catch {
+    return false
+  }
+  if (!scope) return result
+  return result === true ? scope : { and: [result, scope] }
+}
+
+/** Refuses a write that leaves the step outside the caller's scope. Runs in the write's own transaction, so a throw undoes it. */
+const afterChange =
+  (o: Resolved): CollectionAfterChangeHook =>
+  async ({ doc, req }) => {
+    if (!o.scope) return doc
+    const scope = await scopeOf(o, req)
+    const { totalDocs } = await req.payload.count({ collection: o.slug as CollectionSlug, where: { and: [{ id: { equals: doc.id } }, scope!] }, overrideAccess: true, req })
+    if (!totalDocs) throw new ScopeError('This step would be outside your scope.')
+    return doc
+  }
 
 const configOf = (payload: Payload): Resolved => {
   const o = payload.config.custom?.wizards as Resolved | undefined
@@ -51,13 +101,13 @@ export const stepsCollection = (o: Resolved): CollectionConfig => ({
   labels: { singular: 'Guided step', plural: 'Guided steps' },
   admin: { group: o.adminGroup, useAsTitle: 'question', defaultColumns: ['flow', 'group', 'order', 'question', 'active'] },
   access: {
-    read: async (args) => ((await o.edit(args)) === true ? true : { active: { equals: true } }),
-    create: async (args) => (await o.edit(args)) === true,
-    update: async (args) => (await o.edit(args)) === true,
-    delete: async (args) => (await o.edit(args)) === true,
+    read: async (args) => withScope(o, args.req, (await o.edit(args)) === true ? true : { active: { equals: true } }),
+    create: async (args) => (await o.edit(args)) === true && (await withScope(o, args.req, true)) !== false,
+    update: async (args) => withScope(o, args.req, (await o.edit(args)) === true),
+    delete: async (args) => withScope(o, args.req, (await o.edit(args)) === true),
   },
-  hooks: { beforeChange: [beforeChange(o)] },
-  indexes: [{ fields: ['flow', 'key'], unique: true }],
+  hooks: { beforeChange: [beforeChange(o)], afterChange: [afterChange(o)] },
+  indexes: [{ fields: ['flow', 'key', ...(o.scope?.indexWith ?? [])], unique: true }],
   fields: [
     { name: 'flow', type: 'text', required: true, index: true },
     { name: 'key', type: 'text', required: true, admin: { description: 'Stable: answers name it. Don’t reuse a key for a different question.' } },
@@ -116,12 +166,13 @@ const urlOf = (v: unknown) => (v && typeof v === 'object' && typeof (v as { url?
  * The content steps of a flow, in slot order, as the client shows them, in the locale asked for. Only active steps.
  * `empty` names any group of steps with no active step: the flow can't be passed until an editor fixes it.
  */
-export async function flowSteps(payload: Payload, args: { flow: string; locale?: string }): Promise<{ slots: ({ code: string } | { step: Step })[]; empty: string[] }> {
+export async function flowSteps(payload: Payload, args: { flow: string; locale?: string; req?: Req }): Promise<{ slots: ({ code: string } | { step: Step })[]; empty: string[] }> {
   const o = configOf(payload)
+  const scope = await scopeOf(o, args.req)
   const flows = flowsOf(payload)
   const flow = Object.hasOwn(flows, args.flow) ? flows[args.flow]! : null
   if (!flow) throw new Error(`Wizards: no flow "${args.flow}".`)
-  const docs = (await payload.find({ collection: o.slug as CollectionSlug, where: { and: [{ flow: { equals: args.flow } }, { active: { equals: true } }] }, sort: ['order', 'key'], pagination: false, depth: 1, overrideAccess: true, ...(args.locale ? { locale: args.locale as never } : {}) })).docs as Doc[]
+  const docs = (await payload.find({ collection: o.slug as CollectionSlug, where: { and: [{ flow: { equals: args.flow } }, { active: { equals: true } }, ...(scope ? [scope] : [])] }, sort: ['order', 'key'], pagination: false, depth: 1, overrideAccess: true, ...(args.locale ? { locale: args.locale as never } : {}) })).docs as Doc[]
   const out: ({ code: string } | { step: Step })[] = []
   const empty: string[] = []
   for (const slot of flow.slots) {
@@ -157,13 +208,15 @@ export async function flowSteps(payload: Payload, args: { flow: string; locale?:
  * choice a non-stopping option. A group of steps with no active step fails (`noSteps`): a safety group emptied by
  * mistake never waves a flow through. A step changed since the screen loaded fails, and the person sees the new
  * wording. Returns the record to store with the action: the locale, and for each step the hash and the question as
- * the person read it, with the answer and the time.
+ * the person read it, with the answer and the time. With a `scope` set, `req` is required and the check runs inside
+ * the caller's scope; without it the answer is `noScope`, never all sites.
  */
-export async function answersFor(payload: Payload, args: { flow: string; answers: unknown; locale?: string }): Promise<{ ok: true; record: WizardRecord } | { ok: false; problem: 'unknownFlow' | 'noSteps' | 'badAnswers' | 'missing' | 'extra' | 'changed' | 'notYes'; key?: string }> {
+export async function answersFor(payload: Payload, args: { flow: string; answers: unknown; locale?: string; req?: Req }): Promise<{ ok: true; record: WizardRecord } | { ok: false; problem: 'noScope' | 'unknownFlow' | 'noSteps' | 'badAnswers' | 'missing' | 'extra' | 'changed' | 'notYes'; key?: string }> {
   let flow: { slots: ({ code: string } | { step: Step })[]; empty: string[] }
   try {
-    flow = await flowSteps(payload, { flow: args.flow, locale: args.locale })
-  } catch {
+    flow = await flowSteps(payload, { flow: args.flow, locale: args.locale, req: args.req })
+  } catch (e) {
+    if (e instanceof ScopeError) return { ok: false, problem: 'noScope' }
     return { ok: false, problem: 'unknownFlow' }
   }
   if (flow.empty.length) return { ok: false, problem: 'noSteps', key: flow.empty[0] }

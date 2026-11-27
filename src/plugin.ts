@@ -7,7 +7,9 @@ import type { Resolved, WizardsOptions } from './types.js'
 export const wizardsPlugin =
   (options: WizardsOptions): Plugin =>
   (config: Config): Config => {
-    const o: Resolved = { slug: options.slug ?? 'guided-steps', flows: options.flows ?? {}, edit: options?.access?.edit as Access, media: options.media === undefined ? 'media' : options.media, adminGroup: options.adminGroup ?? 'Wizards' }
+    const o: Resolved = { scope: options.scope, slug: options.slug ?? 'guided-steps', flows: options.flows ?? {}, edit: options?.access?.edit as Access, media: options.media === undefined ? 'media' : options.media, adminGroup: options.adminGroup ?? 'Wizards' }
+    if (o.scope && typeof o.scope.where !== 'function') throw new Error('Wizards: `scope.where` must be a function.')
+    if (o.scope?.indexWith && !(Array.isArray(o.scope.indexWith) && o.scope.indexWith.every((f) => typeof f === 'string' && f))) throw new Error('Wizards: `scope.indexWith` must be a list of field names.')
     if (typeof o.edit !== 'function') throw new Error('Wizards: give `access.edit`, saying who may change the steps.')
     if (o.media && !(config.collections ?? []).some((c) => c.slug === o.media && c.upload)) throw new Error(`Wizards: "${o.media}" isn't an upload collection. Set \`media\`, or false for no videos.`)
     return {

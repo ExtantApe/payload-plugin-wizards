@@ -29,3 +29,17 @@ Gaps added: all of the above. Mutation check: 11 of 11 caught, after adding the 
 | The Wizard component | `test/client/*` |
 
 Mutation check on the server: 9 of 9 guards caught.
+
+## 2026-11-26: 0.1.1 scope option
+
+| Promise | Test (`test/scope.test.ts`) |
+| --- | --- |
+| Scope unset is 0.1.0: every step, no `req`, flow + key unique | `unset scope keeps 0.1.0 behavior` |
+| Reads limited to the caller's site: Local, REST list and count, GraphQL, Local count, `flowSteps`, `answersFor` | `reads stay inside the caller's site` |
+| No `req` with a scope refuses `flowSteps` and `answersFor` | `scope fails closed > refuses flowSteps and answersFor…` |
+| A hook that throws, returns `{}`, `null` or an array refuses every read, write, `flowSteps` and `answersFor` | four tests under `scope fails closed` |
+| Create, update, bulk update, delete and REST PATCH limited to the site; a create into or an update moving to another site is refused and leaves nothing changed | `writes stay inside the caller's site` |
+| The empty-group refusal runs per site; the start-up check stays config-wide | `checks run per site` |
+| `indexWith` lets two sites share a key and still refuses a repeat on one site | `indexWith`, plus the unscoped contrast in the first block |
+
+Gaps skipped: a Postgres or SQLite adapter (the check is a plain count in the write's transaction, but only MongoDB was run), the media lookup (reads one file type, unscoped by decision), and versions (the collection has none). Failing-first: with the source change stashed, the new file's setup fails and none of its tests pass.
